@@ -18,7 +18,7 @@ DIR = os.environ.get("AUTOAPPROVE_DIR", os.path.expanduser("~/.config/claude-aut
 STATE = os.path.join(DIR, "state.json")
 LOG = os.path.join(DIR, "decisions.jsonl")
 # Written when a risky command is passed to the user: the app's clicker holds off
-# until you press Resume (or turn auto-approve on again) in the menu.
+# until you press Resume in the menu.
 HOLD = os.path.join(DIR, "hold.json")
 # AskUserQuestion needs real answers; ExitPlanMode needs updatedInput -> leave to clicker/human.
 SKIP = {"AskUserQuestion", "ExitPlanMode"}

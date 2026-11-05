@@ -205,7 +205,6 @@ final class Model: ObservableObject {
 
     /// Master switch. minutes == nil: on until turned off (the default).
     func setEnabled(_ on: Bool, minutes: Double? = nil) {
-        if on && !state.enabled { resumeClicker() }  // turning it on = you've seen what's pending
         var s = state
         s.enabled = on
         s.until = on ? minutes.map { Date().timeIntervalSince1970 + $0 * 60 } : nil
@@ -244,8 +243,8 @@ final class Model: ObservableObject {
         guard state.enabled, state.clicker, trusted else { return }
         let wanted = Set(state.buttons)
         // The hook sent a risky command back to the user: don't press "Allow" on that prompt.
-        // Any hold.json (even unreadable) pauses the clicker until you press Resume or turn
-        // auto-approve on again. A vanished button proves nothing (tab switch, other window).
+        // Any hold.json (even unreadable) pauses the clicker until you press Resume.
+        // A vanished button proves nothing (tab switch, other window), nor does turning ON.
         holding = FileManager.default.fileExists(atPath: holdURL.path)
         if holding { return }
         walkButtons { el, name in

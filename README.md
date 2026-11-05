@@ -92,7 +92,7 @@ Defaults keep the original behavior: ON approves everything until you turn it of
 | **Still ask me for risky commands** | *Settings* (off by default) | Matching Bash commands get the normal prompt. Built-in list: force pushes (`--force`, `-f`, `-uf`, `+ref`), pushes to `main`/`master`, `rm` with both recursive and force flags, `sudo`. It is broad on purpose (a false match costs one click), but it is a seatbelt, not a sandbox. |
 | **Patterns and buttons** | *Settings → Edit risky patterns and buttons…* | Opens `state.json`. Add `"askPatterns": [...]` (Python regular expressions) to replace the built-in list. An invalid pattern counts as a match (fail closed). |
 
-When a risky command goes back to you, the clicker pauses (pause icon in the menu bar) so it can't press "Allow" on that prompt, even if you switch tabs. Answer the prompt, then press **Resume clicker**, or turn auto-approve off and on.
+When a risky command goes back to you, the clicker pauses (pause icon in the menu bar) so it can't press "Allow" on that prompt, even if you switch tabs. Answer the prompt, then press **Resume clicker**. Turning auto-approve off and on does not clear it.
 
 The log keeps one old file: past 1 MB, `decisions.jsonl` moves to `decisions.1.jsonl`. New log files are owner-only (0600) because they hold command text.
 
