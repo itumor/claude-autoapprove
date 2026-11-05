@@ -4,3 +4,6 @@ build/
 .remember/
 *.zip
 .DS_Store
+# Secrets (ElevenLabs key): never commit
+.env
+.env.*

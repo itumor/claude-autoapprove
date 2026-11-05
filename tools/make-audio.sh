@@ -1,7 +1,8 @@
 #!/bin/bash
 # Add voice-over, sound effects and a music bed to the promo video.
 #   tools/make-audio.sh            -> docs/media/autoapprove-promo.mp4 (with audio)
-# Voice: macOS `say` (VOICE=..., RATE=...). Lines + start times: tools/voiceover.txt.
+# Voice: ElevenLabs if .env is filled (bash tools/set-env.sh), else macOS `say` (VOICE=..., RATE=...).
+# TTS=say forces the Mac voice. YES=1 skips the credit prompt. Lines + start times: tools/voiceover.txt.
 # Needs: ffmpeg. Run tools/make-video.sh first (it writes the silent build/video/promo-silent.mp4).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -30,12 +31,62 @@ st(0,if(lt(mod(t,16),4),130.81,if(lt(mod(t,16),8),110,if(lt(mod(t,16),12),87.31,
   -af "lowpass=f=1400,afade=t=in:d=1.5,afade=t=out:st=$(echo "$DUR - 2" | bc):d=2" -ar 48000 -ac 1 "$A/music.wav"
 
 # Voice lines, each placed at its start time.
-vin=(); vf=""; i=0
+starts=(); lines=()
 while IFS='|' read -r start line; do
   [[ -z $start || $start == \#* ]] && continue
-  say -v "$VOICE" -r "$RATE" -o "$A/v$i.aiff" "$line"
-  vin+=(-i "$A/v$i.aiff"); vf+="[$i:a]aresample=48000,adelay=$(echo "$start*1000/1" | bc):all=1[v$i];"; i=$((i+1))
+  starts+=("$start"); lines+=("$line")
 done < tools/voiceover.txt
+n=${#lines[@]}
+
+# ElevenLabs when .env has a key and a voice ID, else macOS `say`. Each line is cached by
+# hash(voice, model, settings, text) in build/audio/cache, so a re-run only pays for changed lines.
+env_get() { [[ -f .env ]] && grep -E "^$1=" .env | cut -d= -f2- || true; }
+EL_KEY="${ELEVENLABS_API_KEY:-$(env_get ELEVENLABS_API_KEY)}"
+EL_VOICE="${ELEVENLABS_VOICE_ID:-$(env_get ELEVENLABS_VOICE_ID)}"
+EL_MODEL="${ELEVENLABS_MODEL:-eleven_multilingual_v2}"
+EL_SETTINGS='{"stability":0.45,"similarity_boost":0.8,"style":0.2,"use_speaker_boost":true}'
+TTS="${TTS:-$([[ -n $EL_KEY && -n $EL_VOICE ]] && echo elevenlabs || echo say)}"
+mkdir -p "$A/cache"
+vfile=()
+for ((k=0; k<n; k++)); do
+  h=$(printf '%s|%s|%s|%s' "$EL_VOICE" "$EL_MODEL" "$EL_SETTINGS" "${lines[$k]}" | shasum -a 256 | cut -c1-16)
+  vfile+=("$A/cache/el-$h.mp3")
+done
+if [[ $TTS == elevenlabs ]]; then
+  todo=0; chars=0
+  for ((k=0; k<n; k++)); do [[ -s ${vfile[$k]} ]] || { todo=$((todo+1)); chars=$((chars+${#lines[$k]})); }; done
+  echo "ElevenLabs ($EL_MODEL): $todo of $n lines to generate, $chars characters (~$chars credits). Cached lines are free."
+  if (( todo > 0 )) && [[ ${YES:-} != 1 ]]; then
+    read -rp "Spend ~$chars credits? [y/N] " ok; [[ $ok == [yY] ]] || { echo "stopped, nothing spent"; exit 1; }
+  fi
+  for ((k=0; k<n; k++)); do
+    [[ -s ${vfile[$k]} ]] && continue
+    body=$(jq -n --arg t "${lines[$k]}" --arg m "$EL_MODEL" --argjson s "$EL_SETTINGS" \
+      --arg p "${lines[$((k-1))]:-}" --arg x "${lines[$((k+1))]:-}" \
+      '{text:$t, model_id:$m, voice_settings:$s} + (if $p != "" then {previous_text:$p} else {} end) + (if $x != "" then {next_text:$x} else {} end)')
+    [[ $k == 0 ]] && body=$(jq 'del(.previous_text)' <<< "$body")
+    tmp="${vfile[$k]}.part"
+    # Key goes in via a header file descriptor, not argv (keeps it out of `ps`).
+    code=$(curl -sS -o "$tmp" -w '%{http_code}' -X POST \
+      "https://api.elevenlabs.io/v1/text-to-speech/$EL_VOICE?output_format=mp3_44100_128" \
+      -H @<(printf 'xi-api-key: %s\n' "$EL_KEY") -H 'Content-Type: application/json' -d "$body")
+    if [[ $code != 200 ]]; then echo "ElevenLabs error $code on line $((k+1)):" >&2; cat "$tmp" >&2; echo >&2; rm -f "$tmp"; exit 1; fi
+    mv "$tmp" "${vfile[$k]}"; echo "  line $((k+1)) ok"
+  done
+else
+  for ((k=0; k<n; k++)); do vfile[$k]="$A/v$k.aiff"; say -v "$VOICE" -r "$RATE" -o "${vfile[$k]}" "${lines[$k]}"; done
+fi
+# Warn when a line runs into the next one (fix by moving start times in tools/voiceover.txt).
+for ((k=0; k<n; k++)); do
+  d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "${vfile[$k]}")
+  end=$(echo "${starts[$k]} + $d" | bc); next=${starts[$((k+1))]:-$DUR}
+  if (( $(echo "$end > $next" | bc) )); then echo "warning: line $((k+1)) ends at $end, next starts at $next" >&2; fi
+done
+vin=(); vf=""
+for ((i=0; i<n; i++)); do
+  vin+=(-i "${vfile[$i]}"); vf+="[$i:a]aresample=48000,adelay=$(echo "${starts[$i]}*1000/1" | bc):all=1[v$i];"
+done
+i=$n
 vmix=""; for ((k=0; k<i; k++)); do vmix+="[v$k]"; done
 ffmpeg -loglevel error -y "${vin[@]}" -filter_complex "${vf}${vmix}amix=inputs=$i:normalize=0,apad,atrim=0:$DUR[o]" -map "[o]" -ar 48000 "$A/voice.wav"
 
