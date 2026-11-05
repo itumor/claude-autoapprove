@@ -35,7 +35,7 @@ starts=(); lines=()
 while IFS='|' read -r start line; do
   [[ -z $start || $start == \#* ]] && continue
   starts+=("$start"); lines+=("$line")
-done < tools/voiceover.txt
+done < "${VO:-tools/voiceover.txt}"   # VO=file: generate a subset (e.g. a one-line test)
 n=${#lines[@]}
 
 # ElevenLabs when .env has a key and a voice ID, else macOS `say`. Each line is cached by
@@ -43,8 +43,8 @@ n=${#lines[@]}
 env_get() { [[ -f .env ]] && grep -E "^$1=" .env | cut -d= -f2- || true; }
 EL_KEY="${ELEVENLABS_API_KEY:-$(env_get ELEVENLABS_API_KEY)}"
 EL_VOICE="${ELEVENLABS_VOICE_ID:-$(env_get ELEVENLABS_VOICE_ID)}"
-EL_MODEL="${ELEVENLABS_MODEL:-eleven_multilingual_v2}"
-EL_SETTINGS='{"stability":0.45,"similarity_boost":0.8,"style":0.2,"use_speaker_boost":true}'
+EL_MODEL="${ELEVENLABS_MODEL:-eleven_v4}"   # highest quality; v4 takes only stability + similarity_boost
+EL_SETTINGS='{"stability":0.5,"similarity_boost":0.75}'
 TTS="${TTS:-$([[ -n $EL_KEY && -n $EL_VOICE ]] && echo elevenlabs || echo say)}"
 mkdir -p "$A/cache"
 vfile=()
@@ -67,24 +67,33 @@ if [[ $TTS == elevenlabs ]]; then
     [[ $k == 0 ]] && body=$(jq 'del(.previous_text)' <<< "$body")
     tmp="${vfile[$k]}.part"
     # Key goes in via a header file descriptor, not argv (keeps it out of `ps`).
-    code=$(curl -sS -o "$tmp" -w '%{http_code}' -X POST \
+    code=$(curl -sS -o "$tmp" -D "$tmp.h" -w '%{http_code}' -X POST \
       "https://api.elevenlabs.io/v1/text-to-speech/$EL_VOICE?output_format=mp3_44100_128" \
       -H @<(printf 'xi-api-key: %s\n' "$EL_KEY") -H 'Content-Type: application/json' -d "$body")
-    if [[ $code != 200 ]]; then echo "ElevenLabs error $code on line $((k+1)):" >&2; cat "$tmp" >&2; echo >&2; rm -f "$tmp"; exit 1; fi
-    mv "$tmp" "${vfile[$k]}"; echo "  line $((k+1)) ok"
+    if [[ $code != 200 ]]; then echo "ElevenLabs error $code on line $((k+1)):" >&2; cat "$tmp" >&2; echo >&2; rm -f "$tmp" "$tmp.h"; exit 1; fi
+    used=$(grep -i '^x-character-count:' "$tmp.h" | tr -dc 0-9); rm -f "$tmp.h"
+    mv "$tmp" "${vfile[$k]}"; echo "  line $((k+1)) ok (${used:-?} characters billed)"
   done
 else
-  for ((k=0; k<n; k++)); do vfile[$k]="$A/v$k.aiff"; say -v "$VOICE" -r "$RATE" -o "${vfile[$k]}" "${lines[$k]}"; done
+  for ((k=0; k<n; k++)); do vfile[$k]="$A/v$k.aiff"; say -v "$VOICE" -r "$RATE" -o "${vfile[$k]}" "$(sed -E 's/\[[a-z ,-]+\] ?//g' <<< "${lines[$k]}")"; done
 fi
-# Warn when a line runs into the next one (fix by moving start times in tools/voiceover.txt).
+[[ -n ${VO:-} ]] && { echo "test only, video untouched:"; printf '  %s\n' "${vfile[@]}"; exit 0; }
+
+# A line longer than its slot is sped up (max 1.2x) instead of regenerated: no extra credits.
+tempo=()
 for ((k=0; k<n; k++)); do
   d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "${vfile[$k]}")
-  end=$(echo "${starts[$k]} + $d" | bc); next=${starts[$((k+1))]:-$DUR}
-  if (( $(echo "$end > $next" | bc) )); then echo "warning: line $((k+1)) ends at $end, next starts at $next" >&2; fi
+  next=${starts[$((k+1))]:-$DUR}; slot=$(echo "$next - ${starts[$k]} - 0.1" | bc)
+  tp=$(echo "if ($d > $slot) $d / $slot else 1" | bc -l)
+  if (( $(echo "$tp > 1.2" | bc) )); then
+    echo "warning: line $((k+1)) is ${d}s for a ${slot}s slot; even at 1.2x it overlaps. Move start times in tools/voiceover.txt." >&2; tp=1.2
+  fi
+  (( $(echo "$tp > 1" | bc) )) && echo "line $((k+1)): ${d}s in a ${slot}s slot -> tempo $(printf %.3f "$tp")"
+  tempo+=("$tp")
 done
 vin=(); vf=""
 for ((i=0; i<n; i++)); do
-  vin+=(-i "${vfile[$i]}"); vf+="[$i:a]aresample=48000,adelay=$(echo "${starts[$i]}*1000/1" | bc):all=1[v$i];"
+  vin+=(-i "${vfile[$i]}"); vf+="[$i:a]aresample=48000,atempo=${tempo[$i]},adelay=$(echo "${starts[$i]}*1000/1" | bc):all=1[v$i];"
 done
 i=$n
 vmix=""; for ((k=0; k<i; k++)); do vmix+="[v$k]"; done

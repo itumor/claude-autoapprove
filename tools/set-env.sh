@@ -20,4 +20,15 @@ read -rp "ElevenLabs voice ID (Enter = keep${voice:+ $voice}): " v
   echo "ELEVENLABS_API_KEY=$key"
   echo "ELEVENLABS_VOICE_ID=$voice"
 } > .env
-echo "saved .env (key: ${key:+set, ${#key} chars}${key:-MISSING}, voice: ${voice:-MISSING})"
+echo "saved .env (key: ${key:+set, ${#key} chars, starts ${key:0:3}…}${key:-MISSING}, voice: ${voice:-MISSING})"
+[[ $key =~ [[:space:]] ]] && echo "warning: the key contains spaces or line breaks; paste it again" >&2
+
+# Free check (no credits): can this key read voices?
+[[ -n $key ]] || exit 0
+code=$(curl -sS -o /dev/null -w '%{http_code}' "https://api.elevenlabs.io/v2/voices?page_size=1" \
+  -H @<(printf 'xi-api-key: %s\n' "$key"))
+case $code in
+  200) echo "key check: OK" ;;
+  401) echo "key check: rejected (401). Wrong or partial key, or it lacks the Voices read permission." >&2 ;;
+  *)   echo "key check: HTTP $code" >&2 ;;
+esac
