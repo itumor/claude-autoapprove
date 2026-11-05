@@ -1,0 +1,6 @@
+build/
+.claude/
+.memsearch/
+.remember/
+*.zip
+.DS_Store
