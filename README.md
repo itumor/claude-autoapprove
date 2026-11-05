@@ -4,6 +4,8 @@
 
 A small menu bar app plus a Claude Code hook. While you switch it on, it approves the permission prompts in the **Claude Code desktop app** for you. Turn it off and every prompt comes back.
 
+![Before and after](docs/promo/before-after.png)
+
 > **Unofficial.** This is a personal tool. It is not affiliated with or endorsed by Anthropic. "Claude" and "Claude Code" are Anthropic's trademarks.
 
 > ⚠️ **Read before use.** While it is ON, the tool approves **everything** it can see. That includes `git push --force`, `rm -rf`, publishing, and commands that match your `ask` rules. The menu bar toggle is the brake. Keep it OFF unless you are watching, or you trust the task.
