@@ -6,6 +6,12 @@ A small menu bar app plus a Claude Code hook. While you switch it on, it approve
 
 ![Before and after](docs/promo/before-after.png)
 
+**See it work.** A real Claude Code desktop session in plan mode. The clicker accepts the plan, and the hook allows the edit and test commands. Nobody clicks anything.
+
+![Demo: plan accepted and commands allowed with no clicks](docs/media/demo.gif)
+
+▶ [Watch the 40-second promo video](docs/media/autoapprove-promo.mp4)
+
 > **Unofficial.** This is a personal tool. It is not affiliated with or endorsed by Anthropic. "Claude" and "Claude Code" are Anthropic's trademarks.
 
 > ⚠️ **Read before use.** While it is ON, the tool approves **everything** it can see. That includes `git push --force`, `rm -rf`, publishing, and commands that match your `ask` rules. The menu bar toggle is the brake. Keep it OFF unless you are watching, or you trust the task.
@@ -74,6 +80,7 @@ Grant Accessibility when macOS asks, or do it in **System Settings → Privacy &
 
 ## Limits
 
+- The clicker works in the main Claude window only. Pop-out session windows show their page as `about:blank`, and nothing the page can't forge marks them as Claude's own, so they are never clicked. The hook still covers tool prompts there.
 - The clicker sees only what is on screen. If Claude's window is minimized or on another Space, macOS hides it. The hook still works.
 - A menu bar manager (Ice, Bartender) or the notch can hide the shield icon. Reveal it there.
 - Claude desktop UI changes can rename buttons or change origins. If that happens, the clicker stops pressing rather than pressing the wrong thing.

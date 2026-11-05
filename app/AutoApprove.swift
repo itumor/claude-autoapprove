@@ -96,19 +96,24 @@ func walkButtons(maxNodes: Int = 30000, _ visit: (AXUIElement, String) -> Bool) 
         // (element, inside a trusted web area?). A button counts only inside a top-level
         // AXWebArea (never nested in another) whose URL is Claude's own origin. Nested web
         // areas (embedded pages) and foreign-origin ones (browser pane) are skipped whole.
-        var stack = ((attr(ax, kAXWindowsAttribute) as? [AXUIElement]) ?? []).map { ($0, false) }
-        var seen = 0
-        while let (e, parentTrusted) = stack.popLast(), seen < maxNodes {
-            seen += 1
-            let role = attr(e, kAXRoleAttribute) as? String
-            var trusted = parentTrusted
-            if role == "AXWebArea" {
-                guard !parentTrusted, isTrustedOrigin(webURL(e), appBundle: app.bundleURL) else { continue }
-                trusted = true
+        // Pop-out session windows report their top-level page as about:blank. No signal the page
+        // can't forge (window title is page-controlled) marks them as Claude's own, so they stay
+        // untrusted: fail closed. The hook still answers tool prompts there.
+        for window in (attr(ax, kAXWindowsAttribute) as? [AXUIElement]) ?? [] {
+            var stack = [(window, false)]
+            var seen = 0
+            while let (e, parentTrusted) = stack.popLast(), seen < maxNodes {
+                seen += 1
+                let role = attr(e, kAXRoleAttribute) as? String
+                var trusted = parentTrusted
+                if role == "AXWebArea" {
+                    guard !parentTrusted, isTrustedOrigin(webURL(e), appBundle: app.bundleURL) else { continue }
+                    trusted = true
+                }
+                if trusted, role == kAXButtonRole as String, !visit(e, label(e)) { return }
+                let kids = (attr(e, kAXChildrenAttribute) as? [AXUIElement]) ?? []
+                stack.append(contentsOf: kids.map { ($0, trusted) })
             }
-            if trusted, role == kAXButtonRole as String, !visit(e, label(e)) { return }
-            let kids = (attr(e, kAXChildrenAttribute) as? [AXUIElement]) ?? []
-            stack.append(contentsOf: kids.map { ($0, trusted) })
         }
     }
 }
