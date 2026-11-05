@@ -6,7 +6,7 @@ A small menu bar app plus a Claude Code hook. While you switch it on, it approve
 
 ![Before and after](docs/promo/before-after.png)
 
-**See it work.** A real Claude Code desktop session in plan mode. The clicker accepts the plan, and the hook allows the edit and test commands. Nobody clicks anything.
+**See it work.** An animated replay of a real run, with the same steps and the same log lines. The clicker accepts the plan, and the hook allows the edit, the tests and the commit. Nobody clicks anything.
 
 ![Demo: plan accepted and commands allowed with no clicks](docs/media/demo.gif)
 

@@ -1,6 +1,6 @@
 // Renders the animated scenes of the promo video as PNG frames:
 //   swift app/make-video.swift            -> build/video/<scene>/0000.png ...
-// tools/make-video.sh stitches them (plus the real screen recording) with ffmpeg.
+// tools/make-video.sh stitches them with ffmpeg; tools/make-audio.sh adds the sound.
 import AppKit
 
 let W: CGFloat = 1920, H: CGFloat = 1080, FPS = 30
@@ -152,15 +152,105 @@ if only == nil || only == "s3" {
     }
 }
 
-// MARK: 4 — backdrop for the real screen recording (1 frame; ffmpeg overlays the footage)
+// MARK: 4 — the tool at work (16 s): a session on the left, the AutoApprove menu on the right.
+// Steps and log lines are the real ones from a recorded run (decisions.jsonl, --log-path task).
 
-if only == nil || only == "frame" {
-    render("frame", seconds: 1.0 / CGFloat(FPS)) { _ in
-        text("The real app, a real session", W / 2, 34, size: 46, weight: .bold, center: true)
-        text("Plan approved by the clicker · edits and tests approved by the hook · zero clicks", W / 2, 98, size: 27,
-             color: orange, center: true)
-        // Footage area: x 160..1760, y 160..1060 (1600x900). Subtle card behind it.
-        box(R(150, 150, 1620, 920), radius: 24, fill: NSColor(white: 0, alpha: 0.35), stroke: dim(0.12))
+if only == nil || only == "s4" {
+    let card = NSColor(white: 0.13, alpha: 0.96), panel = NSColor(white: 0.17, alpha: 0.97)
+    let tAccept: CGFloat = 3.0
+    // (appear time, tool, detail, log line)
+    let steps: [(CGFloat, String, String, String)] = [
+        (3.9, "Edit", "hook/autoapprove.py", "20:32:28  hook   allow    Edit"),
+        (5.0, "Bash", "python3 hook/autoapprove.py --log-path", "20:32:31  hook   allow    Bash"),
+        (5.8, "Bash", "python3 hook/autoapprove.py --selftest", "20:32:33  hook   allow    Bash"),
+        (6.9, "Bash", "git commit -m \"Add --log-path flag\"", "20:32:36  hook   allow    Bash"),
+    ]
+    render("s4", seconds: 16) { t in
+        text("Watch it work", W / 2, 40, size: 52, weight: .bold, color: dim(ease(t, 0, 0.5)), center: true)
+        text("Plan accepted by the clicker · tool prompts allowed by the hook", W / 2, 110, size: 28,
+             color: orange.withAlphaComponent(ease(t, 0.2, 0.7)), center: true)
+
+        // Left: a Claude Code session (generic look).
+        box(R(110, 180, 1060, 840), radius: 22, fill: card, stroke: dim(0.12))
+        for (i, c) in [red, orange, green].enumerated() { box(R(140 + CGFloat(i) * 30, 204, 16, 16), radius: 8, fill: c.withAlphaComponent(0.8)) }
+        text("Claude Code · demo session", 250, 198, size: 22, color: dim(0.55))
+        var y: CGFloat = 260
+        let a0 = ease(t, 0.3, 0.7)
+        box(R(560, y, 570, 64), radius: 16, fill: deep.withAlphaComponent(0.35 * a0))
+        text("Add a --log-path flag to the hook", 585, y + 17, size: 25, color: dim(0.95 * a0))
+        y += 96
+        // Plan card -> accepted.
+        let ap = ease(t, 1.2, 1.7)
+        if ap > 0 {
+            let accepted = t >= tAccept
+            let h: CGFloat = accepted ? 70 : 250
+            box(R(150, y + (1 - ap) * 20, 980, h), radius: 16, fill: NSColor(white: 0.2, alpha: ap), stroke: (accepted ? green : orange).withAlphaComponent(0.6 * ap))
+            if accepted {
+                symbol("checkmark.circle.fill", 175, y + 20, size: 28, colors: [NSColor(white: 0.19, alpha: 1), green])
+                text("Plan accepted  ·  pressed by AutoApprove", 220, y + 20, size: 26, weight: .semibold, color: green)
+            } else {
+                text("Plan: --log-path flag", 180, y + 22, size: 30, weight: .bold, color: dim(ap))
+                for (i, b) in ["Add --log-path: print the decisions log path, exit 0", "Run --log-path and --selftest", "Commit on the branch"].enumerated() {
+                    text("•  " + b, 190, y + 76 + CGFloat(i) * 40, size: 23, color: dim(0.8 * ap))
+                }
+                box(R(820, y + 190, 130, 44), radius: 10, fill: dim(0.1 * ap))
+                text("Reject", 852, y + 198, size: 22, color: dim(0.7 * ap))
+                // Accept button with a press pulse just before tAccept.
+                let press = ease(t, tAccept - 0.35, tAccept)
+                box(R(965, y + 190, 140, 44), radius: 10, fill: deep.blended(withFraction: press, of: green)!.withAlphaComponent(ap))
+                text("Accept", 998, y + 198, size: 22, weight: .semibold, color: NSColor.white.withAlphaComponent(ap))
+                if press > 0 { box(R(965 - 10 * press, y + 190 - 10 * press, 140 + 20 * press, 44 + 20 * press), radius: 14, fill: .clear, stroke: green.withAlphaComponent(1 - press), line: 4) }
+            }
+            y += h + 26
+        }
+        // Tool prompts: shown as "Allow?" for 0.3 s, then approved.
+        for s in steps where t >= s.0 {
+            let p = ease(t, s.0, s.0 + 0.25), ok = t >= s.0 + 0.3
+            box(R(150, y + (1 - p) * 16, 980, 78), radius: 14, fill: NSColor(white: 0.19, alpha: p), stroke: (ok ? green : orange).withAlphaComponent(0.45 * p))
+            text(s.1, 175, y + 12, size: 22, weight: .bold, color: (s.1 == "Edit" ? orange : NSColor(red: 0.55, green: 0.75, blue: 1, alpha: 1)).withAlphaComponent(p))
+            text(s.2, 175, y + 42, size: 21, color: dim(0.85 * p), mono: true)
+            if ok {
+                symbol("checkmark.circle.fill", 960, y + 22, size: 26, colors: [NSColor(white: 0.19, alpha: 1), green])
+                text("Allowed", 1000, y + 24, size: 23, weight: .semibold, color: green)
+            } else {
+                box(R(990, y + 18, 110, 42), radius: 10, fill: deep.withAlphaComponent(p))
+                text("Allow", 1018, y + 26, size: 21, weight: .semibold, color: NSColor.white.withAlphaComponent(p))
+            }
+            y += 96
+        }
+        if t >= 8.6 {
+            let p = ease(t, 8.6, 9.0)
+            text("✓ Committed 124b8fd · selftest ok", 175, y + 6, size: 26, weight: .semibold, color: green.withAlphaComponent(p))
+        }
+
+        // Right: the AutoApprove menu, live.
+        let mp = ease(t, 0.4, 0.9)
+        box(R(1230, 180, 580, 840), radius: 22, fill: panel.withAlphaComponent(mp), stroke: dim(0.15 * mp))
+        icon.draw(in: R(1260, 206, 56, 56), from: .zero, operation: .sourceOver, fraction: mp)
+        text("AutoApprove", 1332, 214, size: 34, weight: .bold, color: dim(mp))
+        for (i, row) in ["Auto-approve", "Hook (tool prompts)", "Clicker (app buttons)"].enumerated() {
+            let ry = 300 + CGFloat(i) * 62
+            text(row, 1265, ry, size: 26, weight: i == 0 ? .bold : .regular, color: dim(0.92 * mp))
+            box(R(1700, ry - 2, 66, 38), radius: 19, fill: green.withAlphaComponent(mp))
+            box(R(1732, ry + 2, 30, 30), radius: 15, fill: NSColor.white.withAlphaComponent(mp))
+        }
+        box(R(1260, 494, 520, 2), radius: 1, fill: dim(0.12 * mp))
+        text("Recent", 1265, 512, size: 22, weight: .semibold, color: dim(0.55 * mp))
+        var log: [String] = []
+        if t >= tAccept { log.append("20:32:25  click  pressed  Accept") }
+        for s in steps where t >= s.0 + 0.3 { log.append(s.3) }
+        for (i, l) in log.reversed().enumerated() {  // newest first, like the app
+            let fresh = i == 0 ? ease(t, t - 0.01, t) : 1  // newest line highlighted
+            let ly = 556 + CGFloat(i) * 46
+            if i == 0 { box(R(1252, ly - 6, 536, 40), radius: 8, fill: green.withAlphaComponent(0.12 * fresh)) }
+            text(l, 1265, ly, size: 21, color: l.contains("click") ? orange : dim(0.85), mono: true)
+        }
+        // Score.
+        if t >= 9.3 {
+            let p = ease(t, 9.3, 9.9)
+            text("5 approvals · 11 seconds · clicks by you: 0", W / 2, 1036 - (1 - p) * 10, size: 30, weight: .bold,
+                 color: orange.withAlphaComponent(p), center: true)
+        }
     }
 }
 
