@@ -42,10 +42,11 @@ n=${#lines[@]}
 # hash(voice, model, settings, text) in build/audio/cache, so a re-run only pays for changed lines.
 env_get() { [[ -f .env ]] && grep -E "^$1=" .env | cut -d= -f2- || true; }
 EL_KEY="${ELEVENLABS_API_KEY:-$(env_get ELEVENLABS_API_KEY)}"
-EL_VOICE="${ELEVENLABS_VOICE_ID:-$(env_get ELEVENLABS_VOICE_ID)}"
+# Voice is pinned (cache key): Eric, smooth and trustworthy. Override with ELEVENLABS_VOICE_ID (re-bills every line).
+EL_VOICE="${ELEVENLABS_VOICE_ID:-cjVigY5qzO86Huf0OWal}"
 EL_MODEL="${ELEVENLABS_MODEL:-eleven_v4}"   # highest quality; v4 takes only stability + similarity_boost
 EL_SETTINGS='{"stability":0.5,"similarity_boost":0.75}'
-TTS="${TTS:-$([[ -n $EL_KEY && -n $EL_VOICE ]] && echo elevenlabs || echo say)}"
+TTS="${TTS:-$([[ -n $EL_KEY ]] && echo elevenlabs || echo say)}"
 mkdir -p "$A/cache"
 vfile=()
 for ((k=0; k<n; k++)); do
@@ -61,23 +62,29 @@ if [[ $TTS == elevenlabs ]]; then
   fi
   for ((k=0; k<n; k++)); do
     [[ -s ${vfile[$k]} ]] && continue
+    prev=""; (( k > 0 )) && prev=${lines[$((k-1))]}
     body=$(jq -n --arg t "${lines[$k]}" --arg m "$EL_MODEL" --argjson s "$EL_SETTINGS" \
-      --arg p "${lines[$((k-1))]:-}" --arg x "${lines[$((k+1))]:-}" \
+      --arg p "$prev" --arg x "${lines[$((k+1))]:-}" \
       '{text:$t, model_id:$m, voice_settings:$s} + (if $p != "" then {previous_text:$p} else {} end) + (if $x != "" then {next_text:$x} else {} end)')
-    [[ $k == 0 ]] && body=$(jq 'del(.previous_text)' <<< "$body")
     tmp="${vfile[$k]}.part"
     # Key goes in via a header file descriptor, not argv (keeps it out of `ps`).
     code=$(curl -sS -o "$tmp" -D "$tmp.h" -w '%{http_code}' -X POST \
       "https://api.elevenlabs.io/v1/text-to-speech/$EL_VOICE?output_format=mp3_44100_128" \
       -H @<(printf 'xi-api-key: %s\n' "$EL_KEY") -H 'Content-Type: application/json' -d "$body")
     if [[ $code != 200 ]]; then echo "ElevenLabs error $code on line $((k+1)):" >&2; cat "$tmp" >&2; echo >&2; rm -f "$tmp" "$tmp.h"; exit 1; fi
-    used=$(grep -i '^x-character-count:' "$tmp.h" | tr -dc 0-9); rm -f "$tmp.h"
-    mv "$tmp" "${vfile[$k]}"; echo "  line $((k+1)) ok (${used:-?} characters billed)"
+    used=$(grep -i '^character-cost:' "$tmp.h" | tr -dc 0-9 || true); rm -f "$tmp.h"
+    mv "$tmp" "${vfile[$k]}"; echo "  line $((k+1)) ok (${used:-?} credits billed)"
   done
 else
   for ((k=0; k<n; k++)); do vfile[$k]="$A/v$k.aiff"; say -v "$VOICE" -r "$RATE" -o "${vfile[$k]}" "$(sed -E 's/\[[a-z ,-]+\] ?//g' <<< "${lines[$k]}")"; done
 fi
 [[ -n ${VO:-} ]] && { echo "test only, video untouched:"; printf '  %s\n' "${vfile[@]}"; exit 0; }
+
+# Trim leading/trailing silence (TTS pads each line) so the timing below uses speech only.
+for ((k=0; k<n; k++)); do
+  ffmpeg -loglevel error -y -i "${vfile[$k]}" -af "silenceremove=start_periods=1:start_threshold=-45dB,areverse,silenceremove=start_periods=1:start_threshold=-45dB,areverse" -ar 48000 -ac 1 "$A/vt$k.wav"
+  vfile[$k]="$A/vt$k.wav"
+done
 
 # A line longer than its slot is sped up (max 1.2x) instead of regenerated: no extra credits.
 tempo=()
@@ -112,7 +119,7 @@ ffmpeg -loglevel error -y "${sin[@]}" -filter_complex "${sf}${smix}amix=inputs=$
 
 # Mix: music ducked under the voice, then loudness-normalized to -16 LUFS (web/social).
 ffmpeg -loglevel error -y -i "$A/voice.wav" -i "$A/music.wav" -i "$A/sfx.wav" -filter_complex \
-  "[0:a]asplit[v][key];[1:a]volume=0.55[m];[m][key]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400[md];\
+  "[0:a]asplit[v][key];[1:a]volume=0.4[m];[m][key]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400[md];\
 [v][md][2:a]amix=inputs=3:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[o]" -map "[o]" -ar 48000 "$A/mix.wav"
 ffmpeg -loglevel error -y -i "$SILENT" -i "$A/mix.wav" -map 0:v -map 1:a -c:v copy -c:a aac -b:a 160k -shortest -movflags +faststart "$OUT"
 ls -lh "$OUT"
