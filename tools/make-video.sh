@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build docs/media/autoapprove-promo.mp4 (+ demo.gif) from rendered scenes and a screen recording.
+# Build docs/media/autoapprove-promo.mp4 (with audio, + demo.gif) from rendered scenes and a screen recording.
 #   tools/make-video.sh <screen-recording.mov> [footage-seconds]
 # Needs: ffmpeg. Renders scenes first (swift app/make-video.swift).
 set -euo pipefail
@@ -40,7 +40,8 @@ seq_seg s5 4.5
 still_seg docs/promo/social-preview.png 4 end
 
 printf "file 'seg/%s.mp4'\n" s1 s2 s3 s4 diagram s5 end > "$V/list.txt"
-ffmpeg -loglevel error -y -f concat -safe 0 -i "$V/list.txt" -c copy -movflags +faststart "$OUT/autoapprove-promo.mp4"
+ffmpeg -loglevel error -y -f concat -safe 0 -i "$V/list.txt" -c copy "$V/promo-silent.mp4"
+bash tools/make-audio.sh   # voice-over, SFX, music -> $OUT/autoapprove-promo.mp4
 
 # README GIF: the real footage only, 900 px wide, 12 fps, 2-pass palette.
 ffmpeg -loglevel error -y -i "$V/seg/s4.mp4" -vf "fps=12,scale=900:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer" "$OUT/demo.gif"

@@ -1,0 +1,10 @@
+# Promo voice-over: start-seconds|line. Read by tools/make-audio.sh.
+# Scenes: prompts 0-4.5, logo 4.5-8, toggle 8-12.5, real session 12.5-28.5,
+# diagram 28.5-31.8, fails closed 31.8-36.3, end card 36.3-39.7.
+0.3|Allow... allow... allow. You came to build. Not to click.
+4.7|Meet AutoApprove. Hands-free approvals for Claude Code on your Mac.
+8.75|One toggle in your menu bar... and it's on.
+12.9|This is a real session. Claude proposes a plan... AutoApprove accepts it. The edit, the tests, the commit... all approved. Zero clicks.
+28.2|Two paths. A hook for prompts... a clicker for buttons.
+32.0|And it fails closed. Quit the app... every prompt comes back.
+36.5|AutoApprove. Open source, on GitHub.
