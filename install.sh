@@ -9,11 +9,19 @@ S="$HOME/.claude/settings.json"
 HOOK="python3 $PWD/hook/autoapprove.py"
 AGENT="$HOME/Library/LaunchAgents/io.github.itumor.claude-autoapprove.plist"
 
+for t in jq python3; do command -v "$t" >/dev/null || { echo "missing $t: install it first (brew install $t)" >&2; exit 1; }; done
+mkdir -p "$(dirname "$S")"
+[[ -f "$S" ]] || echo '{}' > "$S"
+[[ -L "$S" ]] && S="$(readlink -f "$S")"   # write through a symlinked settings.json, don't replace the link
+# Remove only our hook entries (any repo path), keep other hooks in the same group, drop emptied groups.
+DROP='def ours: (.command? // "") | tostring | test("hook/autoapprove\\.py\"?$");
+  ((.hooks.PermissionRequest // []) | map(.hooks = ((.hooks // []) | map(select(ours | not)))) | map(select(.hooks | length > 0)))'
 backup() { cp "$S" "$S.bak.$(date +%s)"; }
 
 if [[ "${1:-}" == "--uninstall" ]]; then
   backup
-  jq --arg c "$HOOK" '.hooks.PermissionRequest |= map(select(.hooks | all(.command != $c)))' "$S" > "$S.tmp"
+  # Matches any repo path, so it also works after the repo moved.
+  jq "$DROP as \$keep | .hooks.PermissionRequest = \$keep" "$S" > "$S.tmp"
   mv "$S.tmp" "$S"
   launchctl bootout "gui/$(id -u)" "$AGENT" || true
   [[ -f "$AGENT" ]] && mv "$AGENT" "$AGENT.removed"
@@ -25,7 +33,8 @@ if jq -e --arg c "$HOOK" '[.hooks.PermissionRequest[]?.hooks[]?.command] | index
   echo "hook already registered"
 else
   backup
-  jq --arg c "$HOOK" '.hooks.PermissionRequest += [{"matcher":"","hooks":[{"type":"command","command":$c}]}]' "$S" > "$S.tmp"
+  # Drop an old entry from a previous repo path, then add this one.
+  jq --arg c "$HOOK" "$DROP as \$keep | .hooks.PermissionRequest = \$keep + [{matcher: \"\", hooks: [{type: \"command\", command: \$c}]}]" "$S" > "$S.tmp"
   mv "$S.tmp" "$S"
   echo "hook registered in $S"
 fi
