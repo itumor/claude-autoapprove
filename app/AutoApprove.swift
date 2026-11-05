@@ -190,8 +190,6 @@ final class Model: ObservableObject {
     @Published var claudeRunning = true
     @Published var now = Date()
     @Published var holding = false       // clicker paused for a risky prompt
-    private var holdStampSeen: String?
-    private var holdSawButton = false
     private var timer: Timer?
     private var ticks = 0
     private var lastMtime: Date?
@@ -207,6 +205,7 @@ final class Model: ObservableObject {
 
     /// Master switch. minutes == nil: on until turned off (the default).
     func setEnabled(_ on: Bool, minutes: Double? = nil) {
+        if on && !state.enabled { resumeClicker() }  // turning it on = you've seen what's pending
         var s = state
         s.enabled = on
         s.until = on ? minutes.map { Date().timeIntervalSince1970 + $0 * 60 } : nil
@@ -245,34 +244,19 @@ final class Model: ObservableObject {
         guard state.enabled, state.clicker, trusted else { return }
         let wanted = Set(state.buttons)
         // The hook sent a risky command back to the user: don't press "Allow" on that prompt.
-        // Any hold.json (even unreadable) pauses the clicker. It clears only after an
-        // allow-listed button was seen and then went away (prompt answered), or via Resume.
-        if let stamp = holdStamp() {
-            if stamp != holdStampSeen { holdStampSeen = stamp; holdSawButton = false }
-            var visible = false
-            walkButtons { _, name in if wanted.contains(name) { visible = true; return false }; return true }
-            if visible { holdSawButton = true; holding = true; return }
-            if !holdSawButton { holding = true; return }
-            if holdStamp() == stamp { try? FileManager.default.removeItem(at: holdURL) }  // not if a newer hold landed
-            holding = false
-            return  // next tick clicks
-        }
-        holding = false
+        // Any hold.json (even unreadable) pauses the clicker until you press Resume or turn
+        // auto-approve on again. A vanished button proves nothing (tab switch, other window).
+        holding = FileManager.default.fileExists(atPath: holdURL.path)
+        if holding { return }
         walkButtons { el, name in
             guard wanted.contains(name), (attr(el, kAXEnabledAttribute) as? Bool) ?? true else { return true }
             // The walk takes time: re-check the switch and timer right before pressing.
-            guard state.enabled, state.until.map({ Date().timeIntervalSince1970 <= $0 }) ?? true else { return false }
+            guard state.enabled, state.until.map({ Date().timeIntervalSince1970 <= $0 }) ?? true,
+                  !FileManager.default.fileExists(atPath: holdURL.path) else { return false }
             let ok = AXUIElementPerformAction(el, kAXPressAction as CFString) == .success
             appendLog(["ts": timestamp.string(from: Date()), "src": "click", "button": name, "decision": ok ? "pressed" : "press-failed"])
             return false  // one press per tick; UI re-renders before next
         }
-    }
-
-    /// File content + modification time; nil when there is no hold.
-    func holdStamp() -> String? {
-        guard let a = try? FileManager.default.attributesOfItem(atPath: holdURL.path) else { return nil }
-        let body = (try? String(contentsOf: holdURL, encoding: .utf8)) ?? ""
-        return "\((a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)|\(body)"
     }
 
     func resumeClicker() { try? FileManager.default.removeItem(at: holdURL); holding = false }
@@ -340,7 +324,7 @@ struct AutoApproveApp: App {
             Divider()
             Button("Quit (turns auto-approve OFF)") { NSApp.terminate(nil) }.keyboardShortcut("q")
         } label: {
-            Image(systemName: m.state.enabled ? (m.state.until == nil ? "checkmark.shield.fill" : "timer") : "shield.slash")
+            Image(systemName: !m.state.enabled ? "shield.slash" : m.holding ? "pause.circle" : m.state.until == nil ? "checkmark.shield.fill" : "timer")
         }
     }
 }

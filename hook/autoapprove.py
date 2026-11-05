@@ -18,7 +18,7 @@ DIR = os.environ.get("AUTOAPPROVE_DIR", os.path.expanduser("~/.config/claude-aut
 STATE = os.path.join(DIR, "state.json")
 LOG = os.path.join(DIR, "decisions.jsonl")
 # Written when a risky command is passed to the user: the app's clicker holds off
-# until it has seen that prompt answered (or you press Resume in the menu).
+# until you press Resume (or turn auto-approve on again) in the menu.
 HOLD = os.path.join(DIR, "hold.json")
 # AskUserQuestion needs real answers; ExitPlanMode needs updatedInput -> leave to clicker/human.
 SKIP = {"AskUserQuestion", "ExitPlanMode"}
@@ -29,7 +29,7 @@ DEFAULT_PATTERNS = [
     r"(?is)\bgit\b.*\bpush\b.*(\s-[a-z]*f|--force|\s\+\S)",       # force push, incl. -uf and +refspec
     r"(?is)\bgit\b.*\bpush\b.*\b(main|master)\b",                  # push to main/master
     r"(?is)\brm\b(?=.*\s(-\w*r|--recursive))(?=.*\s(-\w*f|--force))",  # rm -rf, -Rf, -r -f, --recursive --force
-    r"\bsudo\b",
+    r"(?i)\bsudo\b",
 ]
 HEARTBEAT_MAX_AGE = 10  # app writes status.json every ~3 s
 MAX_TIMER = 24 * 3600   # an `until` further out than this is a typo (ms?) -> fail closed
@@ -46,6 +46,8 @@ def risky(payload, state):
     if state.get("askRisky") is not True or payload.get("tool_name") != "Bash":
         return None
     cmd = str((payload.get("tool_input") or {}).get("command", ""))
+    # Quotes and backslashes don't change what runs: rm "-rf", git push '--force', s\udo.
+    cmd = re.sub(r"[\"'\\]", "", cmd)
     pats = state.get("askPatterns")
     if pats is None:
         pats = DEFAULT_PATTERNS
@@ -62,15 +64,16 @@ def risky(payload, state):
 
 def decide(payload, state, status=None, now=None):
     """(decision, why). decision is ALLOW or None (normal prompt)."""
+    # First, regardless of on/off/heartbeat/hook switch: a risky prompt left waiting
+    # must keep the clicker away even if auto-approve is turned on later.
+    p = risky(payload, state)
+    if p:
+        return None, p
     if state.get("enabled") is not True or not app_alive(status or {}, now):
         return None, None
     until = state.get("until")
     if until is not None and not (isinstance(until, (int, float)) and now <= until <= now + MAX_TIMER):
         return None, "timer"
-    # Checked even with the hook switch off, so the clicker is told to hold off too.
-    p = risky(payload, state)
-    if p:
-        return None, p
     if state.get("hook", True) is not True or payload.get("tool_name") in SKIP:
         return None, None
     return ALLOW, None
@@ -180,7 +183,7 @@ def selftest():
     assert decide(force, risky_on, live, now)[0] is None
     for c in ["git push -f", "git push -uf origin x", "git -C repo push --force", "git push origin +feature",
               "git push \\\n    --force", "git push origin main", "git -c a=b push origin master",
-              "rm -rf build", "rm -fr /", "rm -Rf x", "rm -r -f x", "rm --recursive --force x", "sudo ls"]:
+              "rm -rf build", "rm -fr /", 'rm "-rf" x', "git push '--force'", "s\\udo ls", "SUDO ls", "rm -Rf x", "rm -r -f x", "rm --recursive --force x", "sudo ls"]:
         assert decide({"tool_name": "Bash", "tool_input": {"command": c}}, risky_on, live, now)[0] is None, c
     for c in ["git push origin feature", "git push -u origin feature", "git push --follow-tags",
               "rm -r build", "rm -f x", "ls -la", "git pushd", "git status"]:
@@ -191,6 +194,7 @@ def selftest():
     assert decide(force, {**risky_on, "askPatterns": None}, live, now)[0] is None  # null = defaults
     assert decide(force, {**risky_on, "askPatterns": []}, live, now)[0] == ALLOW
     assert decide(force, {**risky_on, "hook": False}, live, now)[1]  # hook off: still flags it (clicker hold)
+    assert decide(force, {"askRisky": True}, {}, now)[1]  # app off/dead: still flags it
     assert summary(force) == "git push --force origin x"
     assert summary({"tool_name": "Edit", "tool_input": {"file_path": "/a/b/c.py"}}) == "c.py"
     assert summary({"tool_name": "Bash", "tool_input": "x"}) == ""
