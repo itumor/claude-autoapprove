@@ -3,6 +3,8 @@
 //   before-after.png   1600x900
 //   how-it-works.png   1600x900
 //   safety.png         1080x1080
+//   auto-run.png       1600x900   (auto-run of "Run in terminal" blocks)
+//   whats-new.png      1080x1080
 import AppKit
 
 // MARK: palette + helpers (top-left coordinates)
@@ -202,4 +204,60 @@ canvas(1080, 1080, "safety.png") {
         text(it.2, 200, y + 60, size: 22, color: dim(0.72), width: 760)
     }
     text(repoURL, 90, 1000, size: 22, weight: .medium, color: dim(0.65))
+}
+
+// MARK: auto-run 1600x900
+
+// Generic command block (not a copy of any real UI): lead-in line, code, a round Run button.
+func commandBlock(_ y: CGFloat, _ lead: String, _ cmd: String, _ color: NSColor, _ verdict: String, _ why: String, sym: String) {
+    text(lead, 90, y, size: 24, color: dim(0.8))
+    box(R(90, y + 42, 820, 78), radius: 16, fill: NSColor(white: 0.07, alpha: 0.9), stroke: dim(0.14))
+    text(cmd, 118, y + 67, size: 23, color: orange, mono: true)
+    box(R(836, y + 57, 48, 48), radius: 24, fill: color.withAlphaComponent(0.18), stroke: color.withAlphaComponent(0.7))
+    symbol("play.fill", 851, y + 69, size: 20, colors: [color])
+    arrow(from: NSPoint(x: 930, y: y + 81), to: NSPoint(x: 1010, y: y + 81), color: color.withAlphaComponent(0.7))
+    symbol(sym, 1030, y + 58, size: 40, colors: sym == "clock.fill" ? [color] : [bg0, color])
+    text(verdict, 1096, y + 50, size: 28, weight: .bold, color: color)
+    text(why, 1096, y + 88, size: 20, color: dim(0.7), width: 430)
+}
+
+canvas(1600, 900, "auto-run.png") {
+    text("NEW", 90, 60, size: 22, weight: .bold, color: green)
+    text("Auto-run terminal commands", 90, 92, size: 52, weight: .bold)
+    text("Claude hands you a command to run. AutoApprove presses Run, and the output goes back to Claude.", 92, 162, size: 26, color: dim(0.7))
+
+    commandBlock(250, "Run the tests and send me the output:", "npm test -- --watch=false", green,
+                 "Pressed for you", "Written this turn, in the session you are watching. Run once.", sym: "checkmark.circle.fill")
+    commandBlock(420, "Rollback, only if needed:", "kubectl rollout undo deploy/web", orange,
+                 "Left for you", "Rollback, revert, undo, \"only if needed\": never auto-run.", sym: "hand.raised.circle.fill")
+    commandBlock(590, "From yesterday, further up the chat:", "git push origin release", dim(0.6),
+                 "Never touched", "History and other sessions are not run again.", sym: "clock.fill")
+
+    box(R(90, 770, 1420, 70), radius: 18, fill: dim(0.05), stroke: dim(0.12))
+    text("Off by default  ·  Waits until Claude stops  ·  One command at a time  ·  Every press logged", 118, 790, size: 25, weight: .semibold)
+    text(unofficial, 1510 - textWidth(unofficial, size: 16), 856, size: 16, color: dim(0.4))
+}
+
+// MARK: what's new 1080x1080
+
+canvas(1080, 1080, "whats-new.png") {
+    appIcon(90, 90, 130)
+    text("What's new", 250, 104, size: 60, weight: .bold)
+    text("More hands-off, with more brakes.", 254, 180, size: 28, color: orange)
+    let items: [(String, String, String)] = [
+        ("play.circle.fill", "Auto-run terminal commands", "Presses Run on the command blocks Claude hands you. Opt-in."),
+        ("arrow.uturn.backward.circle.fill", "Rollbacks stay yours", "Rollback, revert, undo and \"only if needed\" blocks are never run."),
+        ("timer.circle.fill", "Timed ON", "Turn on for 15 minutes or 1 hour. It switches itself off."),
+        ("exclamationmark.shield.fill", "Still ask me for risky commands", "Force push, push to main, rm -rf, sudo: back to you."),
+        ("checklist", "Setup checklist", "The menu tells you what is missing: Accessibility, hook, Claude."),
+    ]
+    for (i, it) in items.enumerated() {
+        let y = 300 + CGFloat(i) * 136
+        box(R(90, y, 900, 112), radius: 20, fill: dim(0.05), stroke: dim(0.12))
+        symbol(it.0, 120, y + 30, size: 40, colors: it.0 == "checklist" ? [orange] : [bg0, orange])
+        text(it.1, 200, y + 18, size: 30, weight: .bold)
+        text(it.2, 200, y + 60, size: 22, color: dim(0.72), width: 760)
+    }
+    text(repoURL, 90, 1000, size: 22, weight: .medium, color: dim(0.65))
+    text(unofficial, 990 - textWidth(unofficial, size: 16), 1004, size: 16, color: dim(0.4))
 }
