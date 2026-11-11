@@ -21,6 +21,7 @@ struct State: Codable, Equatable {
     var askRisky = false          // off by default: approve everything, as before
     var askPatterns: [String]?    // nil = the hook's built-in defaults (see hook/autoapprove.py)
     var autoRun = false           // off by default: press the "Run in terminal" button on new command blocks
+    var autoRunSkip: [String]?    // nil = defaultSkipPatterns (rollback, undo, "only if needed")
 
     init() {}
     // Every key optional, so an older state.json keeps its values (synthesized Codable
@@ -35,6 +36,7 @@ struct State: Codable, Equatable {
         askRisky = try c.decodeIfPresent(Bool.self, forKey: .askRisky) ?? askRisky
         askPatterns = try c.decodeIfPresent([String].self, forKey: .askPatterns)
         autoRun = try c.decodeIfPresent(Bool.self, forKey: .autoRun) ?? autoRun
+        autoRunSkip = try c.decodeIfPresent([String].self, forKey: .autoRunSkip)
     }
 }
 
@@ -201,16 +203,43 @@ func commandParts(_ button: AXUIElement) -> [String] {
     for _ in 0..<4 {
         guard let p = attr(cur, kAXParentAttribute) else { break }
         cur = p as! AXUIElement
-        var out: [String] = [], stack = [cur], n = 0
-        while let x = stack.popLast() {
-            n += 1
-            if n > 400 { return [] }  // too big to read whole: a cut-off command could hide its risky part
-            if (attr(x, kAXRoleAttribute) as? String) == kAXStaticTextRole as String, let v = attr(x, kAXValueAttribute) as? String { out.append(v) }
-            stack.append(contentsOf: ((attr(x, kAXChildrenAttribute) as? [AXUIElement]) ?? []).reversed())
-        }
+        // Too big to read whole: a cut-off command could hide its risky part.
+        guard let out = texts(cur) else { return [] }
         if !out.joined().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return out }
     }
     return []
+}
+
+/// All static text under an element, in reading order; nil when it is too big to read whole.
+func texts(_ root: AXUIElement, cap: Int = 400) -> [String]? {
+    var out: [String] = [], stack = [root], n = 0
+    while let x = stack.popLast() {
+        n += 1
+        if n > cap { return nil }
+        if (attr(x, kAXRoleAttribute) as? String) == kAXStaticTextRole as String, let v = attr(x, kAXValueAttribute) as? String { out.append(v) }
+        stack.append(contentsOf: ((attr(x, kAXChildrenAttribute) as? [AXUIElement]) ?? []).reversed())
+    }
+    return out
+}
+
+/// The text that introduces a code block: the two elements just before it in the message
+/// ("Rollback, only if needed:"). Empty when there is none.
+// ponytail: only the two elements before the block; a "Rollback" heading further up is missed.
+func leadIn(_ button: AXUIElement, command: String) -> String {
+    var cur = button
+    for _ in 0..<10 {
+        guard let p = attr(cur, kAXParentAttribute) else { break }
+        let parent = p as! AXUIElement
+        let kids = (attr(parent, kAXChildrenAttribute) as? [AXUIElement]) ?? []
+        if let i = kids.firstIndex(where: { CFEqual($0, cur) }), i > 0 {
+            let t = kids[max(0, i - 2)..<i].map { (texts($0) ?? []).joined() }.joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            // The code itself is a sibling of the button bar: not a lead-in.
+            if !t.isEmpty, t != command { return t }
+        }
+        cur = parent
+    }
+    return ""
 }
 
 func commandText(_ button: AXUIElement) -> String {
@@ -231,14 +260,34 @@ let defaultRiskyPatterns = [
     #"(?i)\bsudo\b"#,
 ]
 
-/// Same rule as the hook's risky(): the matching pattern, or nil. A bad pattern counts as a match.
-func riskyPattern(_ cmd: String, _ patterns: [String]?) -> String? {
-    let c = cmd.replacingOccurrences(of: #"["'\\]"#, with: "", options: .regularExpression)
-    for p in patterns ?? defaultRiskyPatterns {
+/// First pattern that matches, or nil. A bad pattern counts as a match (fail closed).
+func firstMatch(_ text: String, _ patterns: [String]) -> String? {
+    for p in patterns {
         guard let re = try? NSRegularExpression(pattern: p) else { return p }
-        if re.firstMatch(in: c, range: NSRange(c.startIndex..., in: c)) != nil { return p }
+        if re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil { return p }
     }
     return nil
+}
+
+/// Same rule as the hook's risky(): the matching pattern, or nil.
+func riskyPattern(_ cmd: String, _ patterns: [String]?) -> String? {
+    firstMatch(cmd.replacingOccurrences(of: #"["'\\]"#, with: "", options: .regularExpression), patterns ?? defaultRiskyPatterns)
+}
+
+// Commands Claude offers "just in case" are never auto-run: rollback, undo, only-if-it-fails.
+// Broad on purpose: a false match only costs you one click.
+let defaultSkipPatterns = [
+    #"(?i)roll[\s-]?back"#,
+    #"(?i)\b(revert|undo)\b"#,
+    #"(?i)\b(only if|if needed|if necessary|in case)\b"#,
+    #"(?i)\bif (it|this|that|something|anything) (fails|breaks|goes wrong)"#,
+]
+
+/// Pattern that keeps a command block from being auto-run, matched on the command and on the
+/// text that introduces it.
+func skipPattern(_ parts: [String], leadIn: String, _ patterns: [String]?) -> String? {
+    let pats = patterns ?? defaultSkipPatterns
+    return firstMatch(parts.joined(), pats) ?? firstMatch(parts.joined(separator: " "), pats) ?? firstMatch(leadIn, pats)
 }
 
 /// Decides which Run button to press. Only a command block that shows up while Claude is
@@ -369,7 +418,9 @@ final class Model: ObservableObject {
         guard let i = runs.step(url: url, cmds: items.map { $0.1 }, busy: busy) else { return }
         let (el, cmd, parts) = items[i]
         var entry = ["ts": timestamp.string(from: Date()), "src": "run", "summary": String(cmd.prefix(80))]
-        if state.askRisky, let p = riskyParts(parts, state.askPatterns) {
+        if let p = skipPattern(parts, leadIn: leadIn(el, command: cmd), state.autoRunSkip) {
+            entry["decision"] = "skip"; entry["why"] = p  // rollback and the like: yours to run
+        } else if state.askRisky, let p = riskyParts(parts, state.askPatterns) {
             entry["decision"] = "ask"; entry["why"] = p  // left for you to run
         } else {
             guard state.enabled, state.until.map({ Date().timeIntervalSince1970 <= $0 }) ?? true,
@@ -477,6 +528,12 @@ enum Entry {
             precondition(riskyPattern("git push -u origin main:main", nil) != nil && riskyPattern("s\\udo ls", nil) != nil)
             precondition(riskyParts(["ls", "sudo x"], nil) != nil && riskyParts(["git push ", "--", "force"], nil) != nil)
             precondition(riskyParts(["echo ", "hi"], nil) == nil)
+            precondition(skipPattern(["kubectl rollout undo deploy/x"], leadIn: "", nil) != nil)
+            precondition(skipPattern(["git reset --hard abc"], leadIn: "Rollback, only if needed:", nil) != nil)
+            precondition(skipPattern(["helm ", "roll", "back x 3"], leadIn: "", nil) != nil)
+            precondition(skipPattern(["git push"], leadIn: "If it fails, run:", nil) != nil)
+            precondition(skipPattern(["git push -u origin feature"], leadIn: "Push needs your click, or you run it:", nil) == nil)
+            precondition(skipPattern(["ls"], leadIn: "", []) == nil && skipPattern(["ls"], leadIn: "", ["("]) == "(")
             precondition(riskyPattern("echo hi", nil) == nil && riskyPattern("ls", ["("]) == "(")
             let t = try! JSONDecoder().decode(State.self, from: Data(#"{"until":123.5,"askRisky":true,"askPatterns":[]}"#.utf8))
             precondition(t.until == 123.5 && t.askRisky && t.askPatterns == [] && !t.enabled && t.buttons == defaultButtons)
@@ -487,7 +544,10 @@ enum Entry {
             guard AXIsProcessTrusted() else { print("not trusted: grant Accessibility to this binary"); exit(1) }
             walkButtons { el, name in
                 print("AXButton: \(name.isEmpty ? "<no label>" : name)")
-                if name == runLabel { print("  cmd=\(commandText(el).debugDescription) url=\(enclosingURL(el))") }
+                if name == runLabel {
+                    let cmd = commandText(el), lead = leadIn(el, command: cmd)
+                    print("  cmd=\(cmd.debugDescription) lead=\(lead.debugDescription) skip=\(skipPattern(commandParts(el), leadIn: lead, nil) ?? "no") url=\(enclosingURL(el))")
+                }
                 return true
             }
             if CommandLine.arguments.contains("--webareas") {
