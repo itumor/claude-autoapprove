@@ -14,7 +14,7 @@ A small menu bar app plus a Claude Code hook. While you switch it on, it approve
 
 > **Unofficial.** This is a personal tool. It is not affiliated with or endorsed by Anthropic. "Claude" and "Claude Code" are Anthropic's trademarks.
 
-> ⚠️ **Read before use.** While it is ON, the tool approves **everything** it can see. That includes `git push --force`, `rm -rf`, publishing, and commands that match your `ask` rules. The menu bar toggle is the brake. Keep it OFF unless you are watching, or you trust the task.
+> ⚠️ **Read before use.** While it is ON, the tool approves **everything** it can see. That includes `git push --force`, `rm -rf`, publishing, and commands that match your `ask` rules. The menu bar toggle is the brake. Keep it OFF unless you are watching, or you trust the task. Use **Turn ON for 15 min** so it can't stay on by accident, and **Settings → Still ask me for risky commands** to keep force-pushes, `rm -rf` and `sudo` for yourself.
 
 ## How it works
 
@@ -47,6 +47,8 @@ Both parts read `~/.config/claude-autoapprove/state.json`. Every decision is add
 - **The clicker trusts only Claude's own UI.** A button is pressed only inside a top-level web area whose URL is `https://claude.ai/…` or a file inside `Claude.app/Contents/Resources`. The built-in browser pane, embedded pages and any other origin are never clicked.
 - **Exact labels only.** The clicker matches the button title exactly. It never presses Deny or Cancel.
 - **Questions stay yours.** `AskUserQuestion` (Claude asking you to choose) is never answered for you.
+- **Timers end on time.** A timed ON switches itself off, and the hook checks the end time too, so a sleeping Mac or a stuck app can't stretch it.
+- **Risky commands can stay yours.** With *Still ask me* on, a matching Bash command gets the normal prompt, and the clicker pauses until you resume it. The list is regex on the command text: a seatbelt, not a sandbox (`eval` or `bash -c "…"` can hide a command from it).
 
 ## Requirements
 
@@ -77,6 +79,23 @@ Grant Accessibility when macOS asks, or do it in **System Settings → Privacy &
 - **Hook** and **Clicker** can be switched separately.
 - If a button is not clicked, show the prompt, then use **Dump Claude button labels…**. Add the label to `buttons` in `state.json`, then **Reload settings**.
 - Default button list: `Allow`, `Allow once`, `Always allow`, `Approve`, `Accept`, `Yes, proceed`, `Publish`, `Continue`. Remove any you want to keep confirming yourself.
+- The top of the menu is a setup check. `Setup ✓` means Accessibility is granted to *this* copy of the app, the hook is installed, and Claude is running. Anything else shows what to fix, with a button for it.
+- The menu shows today's count (`12 approved · 2 asked · 3 clicks`) and the last 10 decisions with the command or file name.
+
+## Settings
+
+Defaults keep the original behavior: ON approves everything until you turn it off. Each extra is opt-in.
+
+| Setting | Where | What it does |
+|---|---|---|
+| **Timed ON** | *Turn ON for 15 min* / *1 hour* | Switches itself off when the time is up. The menu shows the minutes left and the icon becomes a timer. |
+| **Still ask me for risky commands** | *Settings* (off by default) | Matching Bash commands get the normal prompt. Built-in list: force pushes (`--force`, `-f`, `-uf`, `+ref`), pushes to `main`/`master`, `rm` with both recursive and force flags, `sudo`. It is broad on purpose (a false match costs one click), but it is a seatbelt, not a sandbox. |
+| **Auto-run terminal commands** | *Settings* (off by default) | [Full guide](docs/auto-run.md). When Claude ends a turn with a command block for you to run, presses its **▷ Run in terminal and send output to Claude** button. Only the session shown in the Claude window is handled. Blocks written while you watch it are run once each, oldest first, after Claude stops; blocks written while you were in another session run when you come back (within 30 minutes). Blocks that were already there when the app first saw a session, or that are revealed by scrolling, are never pressed. With *Still ask me* on, a command matching the risky list is left for you (the app checks the same patterns with ICU regex). These are often the commands Claude was not allowed to run itself (a push, for example), so leave this off unless you want them run unattended. Rollback-type blocks are never auto-run: if the command or the text introducing it mentions rollback, revert, undo, "only if needed", "in case" or "if it fails", it is left for you and logged as `skip`. Replace the list with `"autoRunSkip": [...]` in `state.json` (`[]` turns it off). |
+| **Patterns and buttons** | *Settings → Edit risky patterns and buttons…* | Opens `state.json`. Add `"askPatterns": [...]` (Python regular expressions) to replace the built-in list. An invalid pattern counts as a match (fail closed). |
+
+When a risky command goes back to you, the clicker pauses (pause icon in the menu bar) so it can't press "Allow" on that prompt, even if you switch tabs. Answer the prompt, then press **Resume clicker**. Turning auto-approve off and on does not clear it.
+
+The log keeps one old file: past 1 MB, `decisions.jsonl` moves to `decisions.1.jsonl`. New log files are owner-only (0600) because they hold command text.
 
 ## Limits
 
@@ -89,6 +108,7 @@ Grant Accessibility when macOS asks, or do it in **System Settings → Privacy &
 
 ```bash
 python3 hook/autoapprove.py --selftest
+~/Applications/AutoApprove.app/Contents/MacOS/AutoApprove --selftest
 ```
 
 ## Uninstall
