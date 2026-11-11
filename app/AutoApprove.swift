@@ -194,22 +194,33 @@ func enclosingURL(_ e: AXUIElement) -> String {
     return ""
 }
 
-/// The command a Run button would run: text of the nearest ancestor that holds any (the code block).
-func commandText(_ button: AXUIElement) -> String {
+/// The command a Run button would run, as its text pieces: nearest ancestor that holds any text
+/// (the code block). Empty when it can't be read in full, and then the button is never pressed.
+func commandParts(_ button: AXUIElement) -> [String] {
     var cur = button
     for _ in 0..<4 {
         guard let p = attr(cur, kAXParentAttribute) else { break }
         cur = p as! AXUIElement
-        var out = "", stack = [cur], n = 0
-        while let x = stack.popLast(), n < 400 {
+        var out: [String] = [], stack = [cur], n = 0
+        while let x = stack.popLast() {
             n += 1
-            if (attr(x, kAXRoleAttribute) as? String) == kAXStaticTextRole as String, let v = attr(x, kAXValueAttribute) as? String { out += v }
+            if n > 400 { return [] }  // too big to read whole: a cut-off command could hide its risky part
+            if (attr(x, kAXRoleAttribute) as? String) == kAXStaticTextRole as String, let v = attr(x, kAXValueAttribute) as? String { out.append(v) }
             stack.append(contentsOf: ((attr(x, kAXChildrenAttribute) as? [AXUIElement]) ?? []).reversed())
         }
-        let t = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !t.isEmpty { return t }
+        if !out.joined().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return out }
     }
-    return ""
+    return []
+}
+
+func commandText(_ button: AXUIElement) -> String {
+    commandParts(button).joined().trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// Risky check on a command rebuilt from text pieces. Pieces may be whole lines with the line
+/// break lost ("ls" + "sudo x") or split tokens ("--" + "force"), so test it glued and spaced.
+func riskyParts(_ parts: [String], _ patterns: [String]?) -> String? {
+    riskyPattern(parts.joined(), patterns) ?? riskyPattern(parts.joined(separator: " "), patterns)
 }
 
 // Keep in sync with DEFAULT_PATTERNS in hook/autoapprove.py.
@@ -353,11 +364,12 @@ final class Model: ObservableObject {
         guard let first = buttons.first else { return }
         let url = enclosingURL(first)
         // One session per tick; a button whose command can't be read is never pressed.
-        let items = buttons.filter { enclosingURL($0) == url }.map { ($0, commandText($0)) }.filter { !$0.1.isEmpty }
+        let items = buttons.filter { enclosingURL($0) == url }.map { ($0, commandParts($0)) }
+            .map { ($0.0, $0.1.joined().trimmingCharacters(in: .whitespacesAndNewlines), $0.1) }.filter { !$0.1.isEmpty }
         guard let i = runs.step(url: url, cmds: items.map { $0.1 }, busy: busy) else { return }
-        let (el, cmd) = items[i]
+        let (el, cmd, parts) = items[i]
         var entry = ["ts": timestamp.string(from: Date()), "src": "run", "summary": String(cmd.prefix(80))]
-        if state.askRisky, let p = riskyPattern(cmd, state.askPatterns) {
+        if state.askRisky, let p = riskyParts(parts, state.askPatterns) {
             entry["decision"] = "ask"; entry["why"] = p  // left for you to run
         } else {
             guard state.enabled, state.until.map({ Date().timeIntervalSince1970 <= $0 }) ?? true,
@@ -463,6 +475,8 @@ enum Entry {
             precondition(r.step(url: "s2", cmds: ["y", "z"], busy: true) == nil)          // page swap, URL unchanged
             precondition(r.step(url: "s2", cmds: ["y", "z"], busy: false) == nil)
             precondition(riskyPattern("git push -u origin main:main", nil) != nil && riskyPattern("s\\udo ls", nil) != nil)
+            precondition(riskyParts(["ls", "sudo x"], nil) != nil && riskyParts(["git push ", "--", "force"], nil) != nil)
+            precondition(riskyParts(["echo ", "hi"], nil) == nil)
             precondition(riskyPattern("echo hi", nil) == nil && riskyPattern("ls", ["("]) == "(")
             let t = try! JSONDecoder().decode(State.self, from: Data(#"{"until":123.5,"askRisky":true,"askPatterns":[]}"#.utf8))
             precondition(t.until == 123.5 && t.askRisky && t.askPatterns == [] && !t.enabled && t.buttons == defaultButtons)
