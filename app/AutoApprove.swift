@@ -20,6 +20,7 @@ struct State: Codable, Equatable {
     var until: Double?            // epoch seconds; nil = on until turned off
     var askRisky = false          // off by default: approve everything, as before
     var askPatterns: [String]?    // nil = the hook's built-in defaults (see hook/autoapprove.py)
+    var autoRun = false           // off by default: press the "Run in terminal" button on new command blocks
 
     init() {}
     // Every key optional, so an older state.json keeps its values (synthesized Codable
@@ -33,6 +34,7 @@ struct State: Codable, Equatable {
         until = try c.decodeIfPresent(Double.self, forKey: .until)
         askRisky = try c.decodeIfPresent(Bool.self, forKey: .askRisky) ?? askRisky
         askPatterns = try c.decodeIfPresent([String].self, forKey: .askPatterns)
+        autoRun = try c.decodeIfPresent(Bool.self, forKey: .autoRun) ?? autoRun
     }
 }
 
@@ -176,6 +178,87 @@ func walkButtons(maxNodes: Int = 30000, _ visit: (AXUIElement, String) -> Bool) 
     }
 }
 
+// MARK: Auto-run ("Run in terminal" button on command blocks)
+
+let runLabel = "Run in terminal and send output to Claude"
+let stopLabel = "Stop"  // shown while Claude is working
+
+/// URL of the web area a button sits in: tells one session from another.
+func enclosingURL(_ e: AXUIElement) -> String {
+    var cur = e
+    for _ in 0..<80 {
+        guard let p = attr(cur, kAXParentAttribute) else { break }
+        cur = p as! AXUIElement
+        if (attr(cur, kAXRoleAttribute) as? String) == "AXWebArea" { return webURL(cur) ?? "" }
+    }
+    return ""
+}
+
+/// The command a Run button would run: text of the nearest ancestor that holds any (the code block).
+func commandText(_ button: AXUIElement) -> String {
+    var cur = button
+    for _ in 0..<4 {
+        guard let p = attr(cur, kAXParentAttribute) else { break }
+        cur = p as! AXUIElement
+        var out = "", stack = [cur], n = 0
+        while let x = stack.popLast(), n < 400 {
+            n += 1
+            if (attr(x, kAXRoleAttribute) as? String) == kAXStaticTextRole as String, let v = attr(x, kAXValueAttribute) as? String { out += v }
+            stack.append(contentsOf: ((attr(x, kAXChildrenAttribute) as? [AXUIElement]) ?? []).reversed())
+        }
+        let t = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty { return t }
+    }
+    return ""
+}
+
+// Keep in sync with DEFAULT_PATTERNS in hook/autoapprove.py.
+let defaultRiskyPatterns = [
+    #"(?is)\bgit\b.*\bpush\b.*(\s-[a-z]*f|--force|\s\+\S)"#,
+    #"(?is)\bgit\b.*\bpush\b.*\b(main|master)\b"#,
+    #"(?is)\brm\b(?=.*\s(-\w*r|--recursive))(?=.*\s(-\w*f|--force))"#,
+    #"(?i)\bsudo\b"#,
+]
+
+/// Same rule as the hook's risky(): the matching pattern, or nil. A bad pattern counts as a match.
+func riskyPattern(_ cmd: String, _ patterns: [String]?) -> String? {
+    let c = cmd.replacingOccurrences(of: #"["'\\]"#, with: "", options: .regularExpression)
+    for p in patterns ?? defaultRiskyPatterns {
+        guard let re = try? NSRegularExpression(pattern: p) else { return p }
+        if re.firstMatch(in: c, range: NSRange(c.startIndex..., in: c)) != nil { return p }
+    }
+    return nil
+}
+
+/// Decides which Run button to press. Only a command block that shows up while Claude is
+/// working, in the session being watched, is run, once, after Claude stops. Everything else
+/// (history, another session, blocks revealed by scrolling) is marked seen and never pressed.
+// ponytail: keyed by command text, so the same command is auto-run once per session view;
+// press the button yourself to repeat it.
+struct RunTracker {
+    var url: String?
+    var last: [String] = []
+    var seen = Set<String>()
+    var pending = Set<String>()   // appeared during a Claude turn, waiting for it to end
+
+    /// cmds: commands of the visible Run buttons, newest first. Returns the index to press.
+    mutating func step(url u: String, cmds: [String], busy: Bool) -> Int? {
+        defer { last = cmds }
+        if u != url { url = u; seen = Set(cmds); pending = []; return nil }  // new session: all history
+        pending.formIntersection(cmds)  // drop half-streamed text that is gone
+        let known = seen.union(pending)
+        let newcomers = cmds.prefix { !known.contains($0) }
+        // Added on top of what was there (not a page swap) while Claude is working.
+        if busy, last.allSatisfy({ !seen.contains($0) || cmds.contains($0) }) { pending.formUnion(newcomers) }
+        seen.formUnion(cmds.filter { !pending.contains($0) })
+        if busy { return nil }
+        let ready = cmds.prefix { pending.contains($0) }
+        guard let cmd = ready.last else { return nil }  // oldest new one first
+        pending.remove(cmd); seen.insert(cmd)
+        return ready.count - 1
+    }
+}
+
 // MARK: Model
 
 let holdURL = dir.appendingPathComponent("hold.json")
@@ -193,6 +276,7 @@ final class Model: ObservableObject {
     private var timer: Timer?
     private var ticks = 0
     private var lastMtime: Date?
+    private var runs = RunTracker()
 
     init() {
         saveState(state)
@@ -240,22 +324,47 @@ final class Model: ObservableObject {
             let st = "{\"trusted\":\(trusted),\"pid\":\(getpid()),\"ts\":\(Int(Date().timeIntervalSince1970))}\n"
             try? st.write(to: dir.appendingPathComponent("status.json"), atomically: true, encoding: .utf8)
         }
-        guard state.enabled, state.clicker, trusted else { return }
+        guard state.enabled, state.clicker, trusted else { runs = RunTracker(); return }
         let wanted = Set(state.buttons)
         // The hook sent a risky command back to the user: don't press "Allow" on that prompt.
         // Any hold.json (even unreadable) pauses the clicker until you press Resume.
         // A vanished button proves nothing (tab switch, other window), nor does turning ON.
         holding = FileManager.default.fileExists(atPath: holdURL.path)
         if holding { return }
+        var runButtons: [AXUIElement] = [], busy = false, pressed = false
         walkButtons { el, name in
+            if name == stopLabel { busy = true }
+            if state.autoRun, name == runLabel { runButtons.append(el); return true }
             guard wanted.contains(name), (attr(el, kAXEnabledAttribute) as? Bool) ?? true else { return true }
             // The walk takes time: re-check the switch and timer right before pressing.
             guard state.enabled, state.until.map({ Date().timeIntervalSince1970 <= $0 }) ?? true,
                   !FileManager.default.fileExists(atPath: holdURL.path) else { return false }
             let ok = AXUIElementPerformAction(el, kAXPressAction as CFString) == .success
             appendLog(["ts": timestamp.string(from: Date()), "src": "click", "button": name, "decision": ok ? "pressed" : "press-failed"])
+            pressed = true
             return false  // one press per tick; UI re-renders before next
         }
+        guard state.autoRun else { runs = RunTracker(); return }
+        if !pressed { autoRun(runButtons, busy: busy) }
+    }
+
+    /// Press the Run button of a command block Claude just wrote (see RunTracker).
+    func autoRun(_ buttons: [AXUIElement], busy: Bool) {
+        guard let first = buttons.first else { return }
+        let url = enclosingURL(first)
+        // One session per tick; a button whose command can't be read is never pressed.
+        let items = buttons.filter { enclosingURL($0) == url }.map { ($0, commandText($0)) }.filter { !$0.1.isEmpty }
+        guard let i = runs.step(url: url, cmds: items.map { $0.1 }, busy: busy) else { return }
+        let (el, cmd) = items[i]
+        var entry = ["ts": timestamp.string(from: Date()), "src": "run", "summary": String(cmd.prefix(80))]
+        if state.askRisky, let p = riskyPattern(cmd, state.askPatterns) {
+            entry["decision"] = "ask"; entry["why"] = p  // left for you to run
+        } else {
+            guard state.enabled, state.until.map({ Date().timeIntervalSince1970 <= $0 }) ?? true,
+                  !FileManager.default.fileExists(atPath: holdURL.path) else { return }
+            entry["decision"] = AXUIElementPerformAction(el, kAXPressAction as CFString) == .success ? "pressed" : "press-failed"
+        }
+        appendLog(entry)
     }
 
     func resumeClicker() { try? FileManager.default.removeItem(at: holdURL); holding = false }
@@ -303,6 +412,7 @@ struct AutoApproveApp: App {
             }
             Menu("Settings") {
                 Toggle("Still ask me for risky commands", isOn: $m.state.askRisky)
+                Toggle("Auto-run terminal commands (▷ Run button)", isOn: $m.state.autoRun)
                 Button("Edit risky patterns and buttons…") { NSWorkspace.shared.open(stateURL) }
             }
             Divider()
@@ -335,7 +445,25 @@ enum Entry {
             // An older state.json (no new keys) must keep its values, not reset to defaults.
             let old = try! JSONDecoder().decode(State.self, from: Data(#"{"enabled":true,"buttons":["X"]}"#.utf8))
             precondition(old.enabled && old.buttons == ["X"] && old.hook && old.clicker && old.until == nil)
-            precondition(!old.askRisky && old.askPatterns == nil)
+            precondition(!old.askRisky && old.askPatterns == nil && !old.autoRun)
+            // Auto-run: history is never pressed; a block written during a turn runs once, after it.
+            var r = RunTracker()
+            precondition(r.step(url: "s1", cmds: ["old"], busy: false) == nil)            // first sight = baseline
+            precondition(r.step(url: "s1", cmds: ["old"], busy: false) == nil)
+            precondition(r.step(url: "s1", cmds: ["ech", "old"], busy: true) == nil)      // streaming
+            precondition(r.step(url: "s1", cmds: ["echo b", "echo a", "old"], busy: true) == nil)
+            precondition(r.step(url: "s1", cmds: ["echo b", "echo a", "old"], busy: false) == 1)  // oldest new first
+            precondition(r.step(url: "s1", cmds: ["echo b", "echo a", "old"], busy: false) == 0)
+            precondition(r.step(url: "s1", cmds: ["echo b", "echo a", "old"], busy: false) == nil) // once only
+            precondition(r.step(url: "s1", cmds: ["echo b", "echo a", "old", "older"], busy: true) == nil)  // scroll-up
+            precondition(r.step(url: "s1", cmds: ["echo b", "echo a", "old", "older"], busy: false) == nil)
+            precondition(r.step(url: "s1", cmds: ["idle"], busy: false) == nil)           // appeared with no turn
+            precondition(r.step(url: "s2", cmds: ["x"], busy: true) == nil)               // other session
+            precondition(r.step(url: "s2", cmds: ["x"], busy: false) == nil)
+            precondition(r.step(url: "s2", cmds: ["y", "z"], busy: true) == nil)          // page swap, URL unchanged
+            precondition(r.step(url: "s2", cmds: ["y", "z"], busy: false) == nil)
+            precondition(riskyPattern("git push -u origin main:main", nil) != nil && riskyPattern("s\\udo ls", nil) != nil)
+            precondition(riskyPattern("echo hi", nil) == nil && riskyPattern("ls", ["("]) == "(")
             let t = try! JSONDecoder().decode(State.self, from: Data(#"{"until":123.5,"askRisky":true,"askPatterns":[]}"#.utf8))
             precondition(t.until == 123.5 && t.askRisky && t.askPatterns == [] && !t.enabled && t.buttons == defaultButtons)
             precondition(isTrustedOrigin("https://claude.ai/x", appBundle: nil) && !isTrustedOrigin("https://claude.ai.evil/x", appBundle: nil))
@@ -343,7 +471,11 @@ enum Entry {
         }
         if CommandLine.arguments.contains("--dump") {
             guard AXIsProcessTrusted() else { print("not trusted: grant Accessibility to this binary"); exit(1) }
-            walkButtons { _, name in print("AXButton: \(name.isEmpty ? "<no label>" : name)"); return true }
+            walkButtons { el, name in
+                print("AXButton: \(name.isEmpty ? "<no label>" : name)")
+                if name == runLabel { print("  cmd=\(commandText(el).debugDescription) url=\(enclosingURL(el))") }
+                return true
+            }
             if CommandLine.arguments.contains("--webareas") {
                 for app in NSRunningApplication.runningApplications(withBundleIdentifier: claudeBundleID) {
                     var stack = (attr(AXUIElementCreateApplication(app.processIdentifier), kAXWindowsAttribute) as? [AXUIElement]) ?? []
