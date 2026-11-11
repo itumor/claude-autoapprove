@@ -150,7 +150,11 @@ func label(_ e: AXUIElement) -> String {
 
 /// Depth-first walk of all Claude windows; calls visit(button, label) for every AXButton.
 // ponytail: full-tree poll, capped at maxNodes; switch to AXObserver if CPU shows up.
+/// URL of the session page (https://claude.ai/...) met by the last walkButtons(), if any.
+var sessionURLSeen: String?
+
 func walkButtons(maxNodes: Int = 30000, _ visit: (AXUIElement, String) -> Bool) {
+    sessionURLSeen = nil
     for app in NSRunningApplication.runningApplications(withBundleIdentifier: claudeBundleID) {
         let ax = AXUIElementCreateApplication(app.processIdentifier)
         // Electron exposes web content to AX only when asked.
@@ -171,6 +175,7 @@ func walkButtons(maxNodes: Int = 30000, _ visit: (AXUIElement, String) -> Bool) 
                 if role == "AXWebArea" {
                     guard !parentTrusted, isTrustedOrigin(webURL(e), appBundle: app.bundleURL) else { continue }
                     trusted = true
+                    if let u = webURL(e), u.hasPrefix("https://") { sessionURLSeen = u }
                 }
                 if trusted, role == kAXButtonRole as String, !visit(e, label(e)) { return }
                 let kids = (attr(e, kAXChildrenAttribute) as? [AXUIElement]) ?? []
@@ -222,9 +227,10 @@ func texts(_ root: AXUIElement, cap: Int = 400) -> [String]? {
     return out
 }
 
-/// The text that introduces a code block: the two elements just before it in the message
+/// The text that introduces a code block: the element just before it in the message
 /// ("Rollback, only if needed:"). Empty when there is none.
-// ponytail: only the two elements before the block; a "Rollback" heading further up is missed.
+// ponytail: only the element right before the block; a "Rollback" heading further up is missed.
+// Looking further back pulls in unrelated text and skips normal commands.
 func leadIn(_ button: AXUIElement, command: String) -> String {
     var cur = button
     for _ in 0..<10 {
@@ -232,8 +238,7 @@ func leadIn(_ button: AXUIElement, command: String) -> String {
         let parent = p as! AXUIElement
         let kids = (attr(parent, kAXChildrenAttribute) as? [AXUIElement]) ?? []
         if let i = kids.firstIndex(where: { CFEqual($0, cur) }), i > 0 {
-            let t = kids[max(0, i - 2)..<i].map { (texts($0) ?? []).joined() }.joined(separator: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let t = (texts(kids[i - 1]) ?? []).joined().trimmingCharacters(in: .whitespacesAndNewlines)
             // The code itself is a sibling of the button bar: not a lead-in.
             if !t.isEmpty, t != command { return t }
         }
@@ -300,16 +305,20 @@ struct RunTracker {
     var last: [String] = []
     var seen = Set<String>()
     var pending = Set<String>()   // appeared during a Claude turn, waiting for it to end
+    var idleTicks = 99            // ticks since Claude was last seen working
 
     /// cmds: commands of the visible Run buttons, newest first. Returns the index to press.
-    mutating func step(url u: String, cmds: [String], busy: Bool) -> Int? {
+    /// resumed: you just came back to this session; blocks written while you were away count as new.
+    mutating func step(url u: String, cmds: [String], busy: Bool, resumed: Bool = false) -> Int? {
         defer { last = cmds }
-        if u != url { url = u; seen = Set(cmds); pending = []; return nil }  // new session: all history
+        idleTicks = busy ? 0 : min(idleTicks + 1, 99)
+        if u != url { url = u; seen = Set(cmds); pending = []; idleTicks = 99; return nil }  // new session: all history
         pending.formIntersection(cmds)  // drop half-streamed text that is gone
         let known = seen.union(pending)
         let newcomers = cmds.prefix { !known.contains($0) }
-        // Added on top of what was there (not a page swap) while Claude is working.
-        if busy, last.allSatisfy({ !seen.contains($0) || cmds.contains($0) }) { pending.formUnion(newcomers) }
+        // Added on top of what was there (not a page swap) while Claude is working, or within
+        // 3 ticks of it stopping: the last message can render at the moment the turn ends.
+        if resumed || idleTicks <= 3 && last.allSatisfy({ !seen.contains($0) || cmds.contains($0) }) { pending.formUnion(newcomers) }
         seen.formUnion(cmds.filter { !pending.contains($0) })
         if busy { return nil }
         let ready = cmds.prefix { pending.contains($0) }
@@ -336,7 +345,9 @@ final class Model: ObservableObject {
     private var timer: Timer?
     private var ticks = 0
     private var lastMtime: Date?
-    private var runs = RunTracker()
+    private var runs: [String: RunTracker] = [:]   // one per session page URL
+    private var runURL: String?                    // session seen last tick
+    private var runSeenAt: [String: Date] = [:]
 
     init() {
         saveState(state)
@@ -384,7 +395,7 @@ final class Model: ObservableObject {
             let st = "{\"trusted\":\(trusted),\"pid\":\(getpid()),\"ts\":\(Int(Date().timeIntervalSince1970))}\n"
             try? st.write(to: dir.appendingPathComponent("status.json"), atomically: true, encoding: .utf8)
         }
-        guard state.enabled, state.clicker, trusted else { runs = RunTracker(); return }
+        guard state.enabled, state.clicker, trusted else { runs = [:]; return }
         let wanted = Set(state.buttons)
         // The hook sent a risky command back to the user: don't press "Allow" on that prompt.
         // Any hold.json (even unreadable) pauses the clicker until you press Resume.
@@ -404,18 +415,25 @@ final class Model: ObservableObject {
             pressed = true
             return false  // one press per tick; UI re-renders before next
         }
-        guard state.autoRun else { runs = RunTracker(); return }
+        guard state.autoRun else { runs = [:]; return }
         if !pressed { autoRun(runButtons, busy: busy) }
     }
 
     /// Press the Run button of a command block Claude just wrote (see RunTracker).
     func autoRun(_ buttons: [AXUIElement], busy: Bool) {
-        guard let first = buttons.first else { return }
-        let url = enclosingURL(first)
-        // One session per tick; a button whose command can't be read is never pressed.
+        guard let url = sessionURLSeen else { runURL = nil; return }
+        let now = Date()
+        // ponytail: fixed 30 min. Away from a session longer than that: its blocks are history again.
+        if let t = runSeenAt[url], now.timeIntervalSince(t) > 1800 { runs[url] = nil }
+        let resumed = runURL != url && runs[url] != nil
+        runURL = url; runSeenAt[url] = now
+        // A button whose command can't be read is never pressed.
         let items = buttons.filter { enclosingURL($0) == url }.map { ($0, commandParts($0)) }
             .map { ($0.0, $0.1.joined().trimmingCharacters(in: .whitespacesAndNewlines), $0.1) }.filter { !$0.1.isEmpty }
-        guard let i = runs.step(url: url, cmds: items.map { $0.1 }, busy: busy) else { return }
+        var tracker = runs[url] ?? RunTracker()
+        let pick = tracker.step(url: url, cmds: items.map { $0.1 }, busy: busy, resumed: resumed)
+        runs[url] = tracker
+        guard let i = pick else { return }
         let (el, cmd, parts) = items[i]
         var entry = ["ts": timestamp.string(from: Date()), "src": "run", "summary": String(cmd.prefix(80))]
         if let p = skipPattern(parts, leadIn: leadIn(el, command: cmd), state.autoRunSkip) {
@@ -520,7 +538,14 @@ enum Entry {
             precondition(r.step(url: "s1", cmds: ["echo b", "echo a", "old"], busy: false) == nil) // once only
             precondition(r.step(url: "s1", cmds: ["echo b", "echo a", "old", "older"], busy: true) == nil)  // scroll-up
             precondition(r.step(url: "s1", cmds: ["echo b", "echo a", "old", "older"], busy: false) == nil)
-            precondition(r.step(url: "s1", cmds: ["idle"], busy: false) == nil)           // appeared with no turn
+            precondition(r.step(url: "s1", cmds: ["late", "echo b", "echo a", "old", "older"], busy: false) == 0)  // rendered as the turn ended
+            for _ in 0..<3 { precondition(r.step(url: "s1", cmds: ["late"], busy: false) == nil) }
+            precondition(r.step(url: "s1", cmds: ["idle", "late"], busy: false) == nil)   // appeared with no turn
+            precondition(r.step(url: "s1", cmds: ["away", "idle", "late"], busy: false, resumed: true) == 0)  // written while away
+            var first = RunTracker()                                                      // session with no block yet
+            precondition(first.step(url: "n", cmds: [], busy: true) == nil)
+            precondition(first.step(url: "n", cmds: ["one"], busy: true) == nil)
+            precondition(first.step(url: "n", cmds: ["one"], busy: false) == 0)
             precondition(r.step(url: "s2", cmds: ["x"], busy: true) == nil)               // other session
             precondition(r.step(url: "s2", cmds: ["x"], busy: false) == nil)
             precondition(r.step(url: "s2", cmds: ["y", "z"], busy: true) == nil)          // page swap, URL unchanged
