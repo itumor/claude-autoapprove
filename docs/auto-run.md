@@ -66,4 +66,5 @@ For each Run button it prints the command it read, the sentence before it, wheth
 
 - Only the session shown in the Claude window. Minimized windows, other Spaces and pop-out windows are not seen.
 - The rollback rule reads the element right before the block. A "Rollback" heading further up, above a neutral command, is missed.
-- Commands are matched by their text. If the app restarts, everything on screen counts as history.
+- Commands are matched by their text.
+- What the app has seen in each session is kept in `~/.config/claude-autoapprove/runs.json` (owner-only), so a restart or rebuild of the app does not lose it: blocks Claude wrote while the app was down run when it is back, within the same 30 minutes. Turning auto-approve OFF, or quitting from the menu, clears it, and everything on screen is history again.

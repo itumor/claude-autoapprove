@@ -19,7 +19,7 @@ struct State: Codable, Equatable {
     var buttons = defaultButtons
     var until: Double?            // epoch seconds; nil = on until turned off
     var askRisky = false          // off by default: approve everything, as before
-    var askPatterns: [String]?    // nil = the hook's built-in defaults (see hook/autoapprove.py)
+    var askPatterns: [String]?    // nil = the built-in list in hook/patterns.json
     var autoRun = false           // off by default: press the "Run in terminal" button on new command blocks
     var autoRunSkip: [String]?    // nil = defaultSkipPatterns (rollback, undo, "only if needed")
 
@@ -97,18 +97,36 @@ func rotateLog() {
     try? FileManager.default.moveItem(at: logURL, to: old)
 }
 
-/// nil when the hook is registered and its script exists, else what to fix.
-func hookProblem() -> String? {
+/// Path of the hook script registered in ~/.claude/settings.json, or nil.
+func hookScript() -> String? {
     let settings = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json")
     guard let d = try? Data(contentsOf: settings), let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-          let groups = (o["hooks"] as? [String: Any])?["PermissionRequest"] as? [[String: Any]] else {
-        return "Hook not installed: run ./install.sh"
-    }
+          let groups = (o["hooks"] as? [String: Any])?["PermissionRequest"] as? [[String: Any]] else { return nil }
     let cmds = groups.flatMap { ($0["hooks"] as? [[String: Any]]) ?? [] }.compactMap { $0["command"] as? String }
-    guard let cmd = cmds.first(where: { $0.contains("autoapprove.py") }) else { return "Hook not installed: run ./install.sh" }
+    guard let cmd = cmds.first(where: { $0.contains("autoapprove.py") }) else { return nil }
     let script = cmd.split(separator: " ").map(String.init).first { $0.hasSuffix("autoapprove.py") } ?? ""
-    guard FileManager.default.fileExists(atPath: (script as NSString).expandingTildeInPath) else {
-        return "Hook script missing (repo moved?): re-run ./install.sh"
+    return (script as NSString).expandingTildeInPath
+}
+
+/// nil when the hook is registered and its script exists, else what to fix.
+func hookProblem() -> String? {
+    guard let script = hookScript() else { return "Hook not installed: run ./install.sh" }
+    guard FileManager.default.fileExists(atPath: script) else { return "Hook script missing (repo moved?): re-run ./install.sh" }
+    return nil
+}
+
+/// The built-in risky list and its test cases: hook/patterns.json, the file the hook reads.
+/// Next to the registered hook when it is there (one file, edited once), else the copy
+/// build.sh put in the bundle. nil when neither can be read.
+struct Patterns: Decodable {
+    struct Cases: Decodable { var risky: [String], safe: [String] }
+    var risky: [String]
+    var cases: Cases?
+}
+func loadPatterns() -> Patterns? {
+    let beside = hookScript().map { URL(fileURLWithPath: $0).deletingLastPathComponent().appendingPathComponent("patterns.json") }
+    for url in [beside, Bundle.main.url(forResource: "patterns", withExtension: "json")] {
+        if let url, let d = try? Data(contentsOf: url), let p = try? JSONDecoder().decode(Patterns.self, from: d) { return p }
     }
     return nil
 }
@@ -156,9 +174,11 @@ func label(_ e: AXUIElement) -> String {
 var sessionBusy: [String: Bool] = [:]
 var stopOutsideSession = false   // a "Stop" button in Claude's own chrome: counts for every session
 var watchBusy = false            // read the busy flag (one more AX call per group) only for auto-run
+/// Also filled by walkButtons(): what it could read. All zero = the clicker is blind (see uiProblem).
+var walkStats = (windows: 0, pages: 0, buttons: 0)
 
 func walkButtons(maxNodes: Int = 30000, _ visit: (AXUIElement, String) -> Bool) {
-    sessionBusy = [:]; stopOutsideSession = false
+    sessionBusy = [:]; stopOutsideSession = false; walkStats = (0, 0, 0)
     for app in NSRunningApplication.runningApplications(withBundleIdentifier: claudeBundleID) {
         let ax = AXUIElementCreateApplication(app.processIdentifier)
         // Electron exposes web content to AX only when asked.
@@ -170,6 +190,7 @@ func walkButtons(maxNodes: Int = 30000, _ visit: (AXUIElement, String) -> Bool) 
         // can't forge (window title is page-controlled) marks them as Claude's own, so they stay
         // untrusted: fail closed. The hook still answers tool prompts there.
         for window in (attr(ax, kAXWindowsAttribute) as? [AXUIElement]) ?? [] {
+            walkStats.windows += 1
             var stack: [(AXUIElement, Bool, String?)] = [(window, false, nil)]
             var seen = 0
             while let (e, parentTrusted, parentSession) = stack.popLast(), seen < maxNodes {
@@ -178,11 +199,12 @@ func walkButtons(maxNodes: Int = 30000, _ visit: (AXUIElement, String) -> Bool) 
                 var trusted = parentTrusted, session = parentSession
                 if role == "AXWebArea" {
                     guard !parentTrusted, isTrustedOrigin(webURL(e), appBundle: app.bundleURL) else { continue }
-                    trusted = true
+                    trusted = true; walkStats.pages += 1
                     if let u = webURL(e), u.hasPrefix("https://") { session = u; if sessionBusy[u] == nil { sessionBusy[u] = false } }
                 }
                 if trusted, role == kAXButtonRole as String {
                     let name = label(e)
+                    walkStats.buttons += 1
                     if name == stopLabel { if let s = session { sessionBusy[s] = true } else { stopOutsideSession = true } }
                     if !visit(e, name) { return }
                 } else if watchBusy, let s = session, sessionBusy[s] == false, role == kAXGroupRole as String,
@@ -281,14 +303,6 @@ func riskyParts(_ parts: [String], _ patterns: [String]?) -> String? {
     riskyPattern(parts.joined(), patterns) ?? riskyPattern(parts.joined(separator: " "), patterns)
 }
 
-// Keep in sync with DEFAULT_PATTERNS in hook/autoapprove.py.
-let defaultRiskyPatterns = [
-    #"(?is)\bgit\b.*\bpush\b.*(\s-[a-z]*f|--force|\s\+\S)"#,
-    #"(?is)\bgit\b.*\bpush\b.*\b(main|master)\b"#,
-    #"(?is)\brm\b(?=.*\s(-\w*r|--recursive))(?=.*\s(-\w*f|--force))"#,
-    #"(?i)\bsudo\b"#,
-]
-
 /// First pattern that matches, or nil. A bad pattern counts as a match (fail closed).
 func firstMatch(_ text: String, _ patterns: [String]) -> String? {
     for p in patterns {
@@ -298,9 +312,11 @@ func firstMatch(_ text: String, _ patterns: [String]) -> String? {
     return nil
 }
 
-/// Same rule as the hook's risky(): the matching pattern, or nil.
+/// Same rule as the hook's risky(): the matching pattern, or nil. patterns nil = the shared
+/// built-in list; when that can't be read, everything is risky (fail closed).
 func riskyPattern(_ cmd: String, _ patterns: [String]?) -> String? {
-    firstMatch(cmd.replacingOccurrences(of: #"["'\\]"#, with: "", options: .regularExpression), patterns ?? defaultRiskyPatterns)
+    guard let pats = patterns ?? loadPatterns()?.risky else { return "risky patterns unreadable" }
+    return firstMatch(cmd.replacingOccurrences(of: #"["'\\]"#, with: "", options: .regularExpression), pats)
 }
 
 // Commands Claude offers "just in case" are never auto-run: rollback, undo, only-if-it-fails.
@@ -324,12 +340,13 @@ func skipPattern(_ parts: [String], leadIn: String, _ patterns: [String]?) -> St
 /// (history, another session, blocks revealed by scrolling) is marked seen and never pressed.
 // ponytail: keyed by command text, so the same command is auto-run once per session view;
 // press the button yourself to repeat it.
-struct RunTracker {
+struct RunTracker: Codable {
     var url: String?
     var last: [String] = []
     var seen = Set<String>()
     var pending = Set<String>()   // appeared during a Claude turn, waiting for it to end
     var idleTicks = 99            // ticks since Claude was last seen working
+    enum CodingKeys: CodingKey { case url, last, seen, pending }  // idleTicks starts over after a restart
 
     /// cmds: commands of the visible Run buttons, newest first. Returns the index to press.
     /// resumed: you just came back to this session; blocks written while you were away count as new.
@@ -353,6 +370,28 @@ struct RunTracker {
     }
 }
 
+/// What auto-run knows about each session, kept on disk so an app restart (crash, rebuild)
+/// does not turn blocks Claude wrote meanwhile into history. Turning auto-approve OFF, or
+/// quitting from the menu (which turns it OFF), still clears it.
+struct RunStore: Codable {
+    var runs: [String: RunTracker] = [:]   // one per session page URL
+    var seenAt: [String: Date] = [:]       // when each session was last on screen
+    /// Sessions not on screen for 30 minutes are forgotten: their blocks are history again.
+    mutating func prune(now: Date) {
+        seenAt = seenAt.filter { now.timeIntervalSince($0.value) <= 1800 }
+        runs = runs.filter { seenAt[$0.key] != nil }
+    }
+}
+let runsURL = dir.appendingPathComponent("runs.json")
+
+/// nil when Claude's window can be read, else why the clicker presses nothing.
+func uiProblem(windows: Int, pages: Int, buttons: Int) -> String? {
+    if windows == 0 { return "No Claude window on screen (minimized or another Space?)" }
+    if pages == 0 { return "Claude UI changed? No Claude page found in its window" }
+    if buttons == 0 { return "Claude UI changed? No buttons found on Claude's page" }
+    return nil
+}
+
 // MARK: Model
 
 let holdURL = dir.appendingPathComponent("hold.json")
@@ -367,6 +406,9 @@ final class Model: ObservableObject {
     @Published var claudeRunning = true
     @Published var now = Date()
     @Published var holding = false       // clicker paused for a risky prompt
+    @Published var uiIssue: String?      // Claude's window can't be read: why nothing is pressed
+    private var uiBad = 0
+    private var savedRuns = Data(), savedRunsAt = Date.distantPast
     private var timer: Timer?
     private var ticks = 0
     private var lastMtime: Date?
@@ -376,6 +418,9 @@ final class Model: ObservableObject {
 
     init() {
         saveState(state)
+        if let d = try? Data(contentsOf: runsURL), let s = try? JSONDecoder().decode(RunStore.self, from: d) {
+            runs = s.runs; runSeenAt = s.seenAt; savedRuns = Self.runsKey(s)
+        }
         if !trusted { requestTrust() }  // macOS shows "AutoApprove would like to control this computer"
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
@@ -400,9 +445,40 @@ final class Model: ObservableObject {
 
     var setupOK: Bool { trusted && hookIssue == nil && claudeRunning }
 
+    private static func runsKey(_ s: RunStore) -> Data {
+        let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]
+        return (try? enc.encode(s.runs)) ?? Data()
+    }
+
+    /// Keep runs.json current. The trackers change rarely; seenAt moves every tick, so it is
+    /// written with them, or once a minute. Owner-only: it holds command text.
+    private func saveRuns() {
+        var s = RunStore(runs: runs, seenAt: runSeenAt)
+        s.prune(now: now)
+        runs = s.runs; runSeenAt = s.seenAt
+        let key = Self.runsKey(s)
+        guard key != savedRuns || (!s.runs.isEmpty && now.timeIntervalSince(savedRunsAt) > 60),
+              let d = try? JSONEncoder().encode(s), (try? d.write(to: runsURL, options: .atomic)) != nil else { return }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: runsURL.path)
+        savedRuns = key; savedRunsAt = now
+    }
+
+    /// After a full walk: can Claude's window still be read? `after` bad walks in a row before it
+    /// shows (a page that is still loading is not a changed UI). Logged once per change.
+    private func noteUI(after n: Int) {
+        let running = !NSRunningApplication.runningApplications(withBundleIdentifier: claudeBundleID).isEmpty
+        let p = running ? uiProblem(windows: walkStats.windows, pages: walkStats.pages, buttons: walkStats.buttons) : nil
+        uiBad = p == nil ? 0 : uiBad + 1
+        let shown = uiBad >= n ? p : nil
+        guard shown != uiIssue else { return }
+        uiIssue = shown
+        if let shown { appendLog(["ts": timestamp.string(from: Date()), "src": "app", "decision": "ui-warning", "why": shown]) }
+    }
+
     func tick() {
         ticks += 1
         now = Date()
+        defer { saveRuns() }
         // Timed ON ran out. The hook checks `until` too, so this is only the visible half.
         if state.enabled, let u = state.until, now.timeIntervalSince1970 > u {
             setEnabled(false)
@@ -420,7 +496,12 @@ final class Model: ObservableObject {
             let st = "{\"trusted\":\(trusted),\"pid\":\(getpid()),\"ts\":\(Int(Date().timeIntervalSince1970))}\n"
             try? st.write(to: dir.appendingPathComponent("status.json"), atomically: true, encoding: .utf8)
         }
-        guard state.enabled, state.clicker, trusted else { runs = [:]; return }
+        guard state.enabled, state.clicker, trusted else {
+            runs = [:]
+            // Clicker idle: still look now and then, so the menu warns before you rely on it.
+            if !trusted { uiIssue = nil } else if ticks % 30 == 1 { walkButtons { _, _ in true }; noteUI(after: 1) }
+            return
+        }
         let wanted = Set(state.buttons)
         // The hook sent a risky command back to the user: don't press "Allow" on that prompt.
         // Any hold.json (even unreadable) pauses the clicker until you press Resume.
@@ -444,6 +525,7 @@ final class Model: ObservableObject {
             pressed = true
             return false  // one press per tick; UI re-renders before next
         }
+        if !pressed { noteUI(after: 3) }  // a press stops the walk early: nothing to learn from it
         guard state.autoRun else { runs = [:]; return }
         if pressed { return }
         // Each visible session on its own; one press per tick.
@@ -459,7 +541,8 @@ final class Model: ObservableObject {
     /// True when it acted on a block (pressed, or logged why not).
     func autoRun(_ url: String, _ buttons: [AXUIElement], old: [AXUIElement], busy: Bool, resumed: Bool) -> Bool {
         let now = Date()
-        // ponytail: fixed 30 min. Away from a session longer than that: its blocks are history again.
+        // ponytail: fixed 30 min (RunStore.prune). Away from a session longer than that: its
+        // blocks are history again.
         if let t = runSeenAt[url], now.timeIntervalSince(t) > 1800 { runs[url] = nil }
         let resumed = resumed && runs[url] != nil
         runSeenAt[url] = now
@@ -523,6 +606,7 @@ struct AutoApproveApp: App {
                 if let h = m.hookIssue { Text("✗ " + h).font(.caption) }
                 if !m.claudeRunning { Text("✗ Claude desktop not running").font(.caption) }
             }
+            if let u = m.uiIssue { Text("⚠ \(u). The clicker can't press anything.").font(.caption) }
             Divider()
             Toggle(m.title, isOn: Binding(get: { m.state.enabled }, set: { m.setEnabled($0) }))
             if !m.state.enabled {
@@ -592,11 +676,27 @@ enum Entry {
             precondition(first.step(url: "n", cmds: [], busy: true) == nil)
             precondition(first.step(url: "n", cmds: ["one"], busy: true) == nil)
             precondition(first.step(url: "n", cmds: ["one"], busy: false) == 0)
+            // Restart: what was known comes back from runs.json; a block written meanwhile runs once.
+            var store = RunStore(runs: ["n": first], seenAt: ["n": Date(timeIntervalSince1970: 1000), "gone": Date(timeIntervalSince1970: 0)])
+            store.runs["gone"] = RunTracker()
+            store = try! JSONDecoder().decode(RunStore.self, from: JSONEncoder().encode(store))
+            store.prune(now: Date(timeIntervalSince1970: 1000 + 1800))
+            precondition(store.runs.keys.sorted() == ["n"] && store.seenAt["gone"] == nil)   // 30 min away: forgotten
+            var back = store.runs["n"]!
+            precondition(back.step(url: "n", cmds: ["two", "one"], busy: false, resumed: true) == 0)
+            precondition(back.step(url: "n", cmds: ["two", "one"], busy: false) == nil)   // "one" ran before the restart
+            precondition(uiProblem(windows: 1, pages: 1, buttons: 9) == nil && uiProblem(windows: 0, pages: 0, buttons: 0) != nil)
+            precondition(uiProblem(windows: 1, pages: 0, buttons: 0)!.hasPrefix("Claude UI changed") && uiProblem(windows: 1, pages: 1, buttons: 0) != nil)
             precondition(r.step(url: "s2", cmds: ["x"], busy: true) == nil)               // other session
             precondition(r.step(url: "s2", cmds: ["x"], busy: false) == nil)
             precondition(r.step(url: "s2", cmds: ["y", "z"], busy: true) == nil)          // page swap, URL unchanged
             precondition(r.step(url: "s2", cmds: ["y", "z"], busy: false) == nil)
-            precondition(riskyPattern("git push -u origin main:main", nil) != nil && riskyPattern("s\\udo ls", nil) != nil)
+            // Same cases the hook's --selftest runs with Python re: one list, two engines.
+            guard let shared = loadPatterns(), let cases = shared.cases, cases.risky.count > 10, cases.safe.count > 5 else {
+                print("selftest failed: patterns.json not found next to the hook or in the bundle"); exit(1)
+            }
+            for c in cases.risky where riskyPattern(c, shared.risky) == nil { print("selftest failed: not risky: \(c)"); exit(1) }
+            for c in cases.safe where riskyPattern(c, shared.risky) != nil { print("selftest failed: risky: \(c)"); exit(1) }
             precondition(riskyParts(["ls", "sudo x"], nil) != nil && riskyParts(["git push ", "--", "force"], nil) != nil)
             precondition(riskyParts(["echo ", "hi"], nil) == nil)
             precondition(skipPattern(["kubectl rollout undo deploy/x"], leadIn: "", nil) != nil)
@@ -626,6 +726,7 @@ enum Entry {
                 return true
             }
             for (u, b) in sessionBusy { print("Session busy=\(b || stopOutsideSession) url=\(u)") }
+            print("UI: \(uiProblem(windows: walkStats.windows, pages: walkStats.pages, buttons: walkStats.buttons) ?? "ok") windows=\(walkStats.windows) pages=\(walkStats.pages) buttons=\(walkStats.buttons)")
             if CommandLine.arguments.contains("--webareas") {
                 for app in NSRunningApplication.runningApplications(withBundleIdentifier: claudeBundleID) {
                     var stack = (attr(AXUIElementCreateApplication(app.processIdentifier), kAXWindowsAttribute) as? [AXUIElement]) ?? []
