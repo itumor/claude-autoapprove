@@ -23,14 +23,9 @@ HOLD = os.path.join(DIR, "hold.json")
 # AskUserQuestion needs real answers; ExitPlanMode needs updatedInput -> leave to clicker/human.
 SKIP = {"AskUserQuestion", "ExitPlanMode"}
 ALLOW = {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}}
-# Used when state.json has no askPatterns, so improved defaults reach existing installs.
-# Broad on purpose: a false match only costs you one click. Not a sandbox.
-DEFAULT_PATTERNS = [
-    r"(?is)\bgit\b.*\bpush\b.*(\s-[a-z]*f|--force|\s\+\S)",       # force push, incl. -uf and +refspec
-    r"(?is)\bgit\b.*\bpush\b.*\b(main|master)\b",                  # push to main/master
-    r"(?is)\brm\b(?=.*\s(-\w*r|--recursive))(?=.*\s(-\w*f|--force))",  # rm -rf, -Rf, -r -f, --recursive --force
-    r"(?i)\bsudo\b",
-]
+# The built-in risky list, used when state.json has no askPatterns. Shared with the app,
+# which reads this same file. Unreadable = every Bash command is risky (fail closed).
+PATTERNS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "patterns.json")
 HEARTBEAT_MAX_AGE = 10  # app writes status.json every ~3 s
 MAX_TIMER = 24 * 3600   # an `until` further out than this is a typo (ms?) -> fail closed
 
@@ -50,9 +45,9 @@ def risky(payload, state):
     cmd = re.sub(r"[\"'\\]", "", cmd)
     pats = state.get("askPatterns")
     if pats is None:
-        pats = DEFAULT_PATTERNS
+        pats = load_json(PATTERNS).get("risky")
     if not isinstance(pats, list):
-        return "askPatterns is not a list"
+        return "risky patterns unreadable"
     for p in pats:
         try:
             if re.search(p, cmd):
@@ -157,6 +152,7 @@ def main():
 
 
 def selftest():
+    global PATTERNS
     p = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
     live, now = {"ts": 1000}, 1003
     on = {"enabled": True}
@@ -181,18 +177,22 @@ def selftest():
     risky_on = {"enabled": True, "askRisky": True}
     assert decide(force, on, live, now)[0] == ALLOW
     assert decide(force, risky_on, live, now)[0] is None
-    for c in ["git push -f", "git push -uf origin x", "git -C repo push --force", "git push origin +feature",
-              "git push \\\n    --force", "git push origin main", "git -c a=b push origin master",
-              "rm -rf build", "rm -fr /", 'rm "-rf" x', "git push '--force'", "s\\udo ls", "SUDO ls", "rm -Rf x", "rm -r -f x", "rm --recursive --force x", "sudo ls"]:
+    # Same cases the app's --selftest runs with ICU regex: one list, two engines.
+    cases = load_json(PATTERNS)["cases"]
+    assert len(cases["risky"]) > 10 and len(cases["safe"]) > 5
+    for c in cases["risky"]:
         assert decide({"tool_name": "Bash", "tool_input": {"command": c}}, risky_on, live, now)[0] is None, c
-    for c in ["git push origin feature", "git push -u origin feature", "git push --follow-tags",
-              "rm -r build", "rm -f x", "ls -la", "git pushd", "git status"]:
+    for c in cases["safe"]:
         assert decide({"tool_name": "Bash", "tool_input": {"command": c}}, risky_on, live, now)[0] == ALLOW, c
     assert decide({"tool_name": "Write", "tool_input": {"file_path": "/x/sudo"}}, risky_on, live, now)[0] == ALLOW
     assert decide(p, {**risky_on, "askPatterns": ["("]}, live, now)[0] is None  # bad regex: fail closed
     assert decide(p, {**risky_on, "askPatterns": "sudo"}, live, now)[0] is None  # not a list: fail closed
     assert decide(force, {**risky_on, "askPatterns": None}, live, now)[0] is None  # null = defaults
     assert decide(force, {**risky_on, "askPatterns": []}, live, now)[0] == ALLOW
+    real, PATTERNS = PATTERNS, "/nonexistent/patterns.json"  # list missing: fail closed
+    assert decide(p, risky_on, live, now) == (None, "risky patterns unreadable")
+    assert decide(p, on, live, now)[0] == ALLOW  # Still-ask off: the list is not needed
+    PATTERNS = real
     assert decide(force, {**risky_on, "hook": False}, live, now)[1]  # hook off: still flags it (clicker hold)
     assert decide(force, {"askRisky": True}, {}, now)[1]  # app off/dead: still flags it
     assert summary(force) == "git push --force origin x"

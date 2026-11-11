@@ -1,0 +1,42 @@
+{
+  "_about": "Risky-command list used when state.json has no askPatterns. One file for both engines: hook/autoapprove.py (Python re) and AutoApprove.app (ICU regex; build.sh also copies it into the bundle). Both --selftest runs check every entry in cases. Broad on purpose: a false match costs one click. Not a sandbox.",
+  "risky": [
+    "(?is)\\bgit\\b.*\\bpush\\b.*(\\s-[a-z]*f|--force|\\s\\+\\S)",
+    "(?is)\\bgit\\b.*\\bpush\\b.*\\b(main|master)\\b",
+    "(?is)\\brm\\b(?=.*\\s(-\\w*r|--recursive))(?=.*\\s(-\\w*f|--force))",
+    "(?i)\\bsudo\\b"
+  ],
+  "cases": {
+    "risky": [
+      "git push -f",
+      "git push -uf origin x",
+      "git -C repo push --force",
+      "git push origin +feature",
+      "git push \\\n    --force",
+      "git push origin main",
+      "git -c a=b push origin master",
+      "git push -u origin main:main",
+      "rm -rf build",
+      "rm -fr /",
+      "rm \"-rf\" x",
+      "git push '--force'",
+      "s\\udo ls",
+      "SUDO ls",
+      "rm -Rf x",
+      "rm -r -f x",
+      "rm --recursive --force x",
+      "sudo ls"
+    ],
+    "safe": [
+      "git push origin feature",
+      "git push -u origin feature",
+      "git push --follow-tags",
+      "rm -r build",
+      "rm -f x",
+      "ls -la",
+      "git pushd",
+      "git status",
+      "echo hi"
+    ]
+  }
+}

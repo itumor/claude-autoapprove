@@ -67,6 +67,18 @@ cd claude-autoapprove
 open ~/Applications/AutoApprove.app
 ```
 
+**Or from a release zip** (no Xcode tools needed): download `AutoApprove-<version>.zip` from [Releases](https://github.com/itumor/claude-autoapprove/releases), unzip it, and keep the folder (the hook runs from it):
+
+```bash
+cd AutoApprove
+mkdir -p ~/Applications && ditto AutoApprove.app ~/Applications/AutoApprove.app
+xattr -dr com.apple.quarantine ~/Applications/AutoApprove.app   # the build is not notarized
+./install.sh
+open ~/Applications/AutoApprove.app
+```
+
+Release builds are signed ad-hoc, so macOS asks for Accessibility again after each update.
+
 Grant Accessibility when macOS asks, or do it in **System Settings → Privacy & Security → Accessibility**:
 
 ![Accessibility permission](docs/img/accessibility.png)
@@ -79,7 +91,7 @@ Grant Accessibility when macOS asks, or do it in **System Settings → Privacy &
 - **Hook** and **Clicker** can be switched separately.
 - If a button is not clicked, show the prompt, then use **Dump Claude button labels…**. Add the label to `buttons` in `state.json`, then **Reload settings**.
 - Default button list: `Allow`, `Allow once`, `Always allow`, `Approve`, `Accept`, `Yes, proceed`, `Publish`, `Continue`. Remove any you want to keep confirming yourself.
-- The top of the menu is a setup check. `Setup ✓` means Accessibility is granted to *this* copy of the app, the hook is installed, and Claude is running. Anything else shows what to fix, with a button for it.
+- The top of the menu is a setup check. `Setup ✓` means Accessibility is granted to *this* copy of the app, the hook is installed, and Claude is running. Anything else shows what to fix, with a button for it. A `⚠` line under it means the app can't read Claude's window right now (minimized, on another Space, or Claude's UI changed), so the clicker presses nothing; the hook still works. It is also logged as `ui-warning`.
 - The menu shows today's count (`12 approved · 2 asked · 3 clicks`) and the last 10 decisions with the command or file name.
 
 ## Settings
@@ -91,7 +103,7 @@ Defaults keep the original behavior: ON approves everything until you turn it of
 | **Timed ON** | *Turn ON for 15 min* / *1 hour* | Switches itself off when the time is up. The menu shows the minutes left and the icon becomes a timer. |
 | **Still ask me for risky commands** | *Settings* (off by default) | Matching Bash commands get the normal prompt. Built-in list: force pushes (`--force`, `-f`, `-uf`, `+ref`), pushes to `main`/`master`, `rm` with both recursive and force flags, `sudo`. It is broad on purpose (a false match costs one click), but it is a seatbelt, not a sandbox. |
 | **Auto-run terminal commands** | *Settings* (off by default) | [Full guide](docs/auto-run.md). When Claude ends a turn with a command block for you to run, presses its **▷ Run in terminal and send output to Claude** button. Only the session shown in the Claude window is handled. Blocks written while you watch it are run once each, oldest first, after Claude stops; blocks written while you were in another session run when you come back (within 30 minutes). Blocks that were already there when the app first saw a session, or that are revealed by scrolling, are never pressed. With *Still ask me* on, a command matching the risky list is left for you (the app checks the same patterns with ICU regex). These are often the commands Claude was not allowed to run itself (a push, for example), so leave this off unless you want them run unattended. Rollback-type blocks are never auto-run: if the command or the text introducing it mentions rollback, revert, undo, "only if needed", "in case" or "if it fails", it is left for you and logged as `skip`. Replace the list with `"autoRunSkip": [...]` in `state.json` (`[]` turns it off). |
-| **Patterns and buttons** | *Settings → Edit risky patterns and buttons…* | Opens `state.json`. Add `"askPatterns": [...]` (Python regular expressions) to replace the built-in list. An invalid pattern counts as a match (fail closed). |
+| **Patterns and buttons** | *Settings → Edit risky patterns and buttons…* | Opens `state.json`. Add `"askPatterns": [...]` (Python regular expressions) to replace the built-in list. The built-in list is one file, `hook/patterns.json`, read by both the hook and the app; both selftests run its test cases. If it can't be read, every command counts as risky. An invalid pattern counts as a match (fail closed). |
 
 When a risky command goes back to you, the clicker pauses (pause icon in the menu bar) so it can't press "Allow" on that prompt, even if you switch tabs. Answer the prompt, then press **Resume clicker**. Turning auto-approve off and on does not clear it.
 
@@ -110,6 +122,8 @@ The log keeps one old file: past 1 MB, `decisions.jsonl` moves to `decisions.1.j
 python3 hook/autoapprove.py --selftest
 ~/Applications/AutoApprove.app/Contents/MacOS/AutoApprove --selftest
 ```
+
+`./build.sh` runs the app selftest too and stops if it fails. On GitHub, every pull request runs both, and a `v*` tag publishes the release zip (`.github/workflows/build.yml`).
 
 ## Uninstall
 
