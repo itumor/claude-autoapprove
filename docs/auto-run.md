@@ -16,6 +16,7 @@ It is **off by default**. Turn it on in the menu: **Settings → Auto-run termin
 | Written while you were in another session | Run when you come back to that session, if you were away less than 30 minutes. |
 | Already there when the app first saw the session | Never run. |
 | Revealed by scrolling up | Never run. |
+| From before your latest message | Never run. |
 | The same command text, given again in the same session | Not run again. Press the button yourself. |
 | A command the app cannot read in full | Never run. |
 

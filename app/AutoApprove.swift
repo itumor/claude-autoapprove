@@ -200,6 +200,9 @@ func walkButtons(maxNodes: Int = 30000, _ visit: (AXUIElement, String) -> Bool) 
 
 let runLabel = "Run in terminal and send output to Claude"
 let stopLabel = "Stop"  // shown while Claude is working
+// Label of the button on each of your own messages. The walk goes newest first, so a Run button
+// met after one of these belongs to an earlier exchange: history, never auto-run.
+let userMessagePrefix = "Show message actions for You said"
 
 /// URL of the web area a button sits in: tells one session from another.
 func enclosingURL(_ e: AXUIElement) -> String {
@@ -238,13 +241,20 @@ func texts(_ root: AXUIElement, cap: Int = 400) -> [String]? {
     return out
 }
 
-/// The text that introduces a code block: the element just before it in the message
+/// Pure part of leadIn(): candidates are the nearest text before the block at each level, going
+/// up. A short first hit is a label inside the block ("bash"), so the next one is added to it.
+func pickLeadIn(_ candidates: [String]) -> String {
+    guard let first = candidates.first else { return "" }
+    return first.count < 20 && candidates.count > 1 ? first + " " + candidates[1] : first
+}
+
+/// The text that introduces a code block: what sits just before it in the message
 /// ("Rollback, only if needed:"). Empty when there is none.
-// ponytail: only the element right before the block; a "Rollback" heading further up is missed.
-// Looking further back pulls in unrelated text and skips normal commands.
+// ponytail: nearest text only; a "Rollback" heading further up is missed. Looking further
+// back pulls in unrelated text and skips normal commands.
 func leadIn(_ button: AXUIElement, command: String) -> String {
-    var cur = button
-    for _ in 0..<10 {
+    var cur = button, found: [String] = []
+    for _ in 0..<10 where found.count < 2 {
         guard let p = attr(cur, kAXParentAttribute) else { break }
         let parent = p as! AXUIElement
         let kids = (attr(parent, kAXChildrenAttribute) as? [AXUIElement]) ?? []
@@ -252,13 +262,13 @@ func leadIn(_ button: AXUIElement, command: String) -> String {
             for k in kids[..<i].reversed() {  // nearest sibling with any text; empty spacers don't hide it
                 let t = (texts(k) ?? []).joined().trimmingCharacters(in: .whitespacesAndNewlines)
                 if t.isEmpty { continue }
-                if t != command { return t }
-                break  // the code itself is a sibling of the button bar: not a lead-in, look higher
+                if t != command { found.append(t) }  // the code itself is a sibling of the button bar
+                break
             }
         }
         cur = parent
     }
-    return ""
+    return pickLeadIn(found)
 }
 
 func commandText(_ button: AXUIElement) -> String {
@@ -417,10 +427,14 @@ final class Model: ObservableObject {
         // A vanished button proves nothing (tab switch, other window), nor does turning ON.
         holding = FileManager.default.fileExists(atPath: holdURL.path)
         if holding { return }
-        var runButtons: [AXUIElement] = [], pressed = false
+        var runButtons: [AXUIElement] = [], oldRuns: [AXUIElement] = [], pressed = false, pastUserMessage = false
         watchBusy = state.autoRun
         walkButtons { el, name in
-            if state.autoRun, name == runLabel { runButtons.append(el); return true }
+            if name.hasPrefix(userMessagePrefix) { pastUserMessage = true }
+            if state.autoRun, name == runLabel {
+                if pastUserMessage { oldRuns.append(el) } else { runButtons.append(el) }
+                return true
+            }
             guard wanted.contains(name), (attr(el, kAXEnabledAttribute) as? Bool) ?? true else { return true }
             // The walk takes time: re-check the switch and timer right before pressing.
             guard state.enabled, state.until.map({ Date().timeIntervalSince1970 <= $0 }) ?? true,
@@ -436,24 +450,32 @@ final class Model: ObservableObject {
         let sessions = sessionBusy
         for url in sessions.keys.sorted() {
             let resumed = !runURLs.contains(url) && runs[url] != nil
-            if autoRun(url, runButtons, busy: sessions[url] == true || stopOutsideSession, resumed: resumed) { break }
+            if autoRun(url, runButtons, old: oldRuns, busy: sessions[url] == true || stopOutsideSession, resumed: resumed) { break }
         }
         runURLs = Set(sessions.keys)
     }
 
     /// Press the Run button of a command block Claude just wrote (see RunTracker).
     /// True when it acted on a block (pressed, or logged why not).
-    func autoRun(_ url: String, _ buttons: [AXUIElement], busy: Bool, resumed: Bool) -> Bool {
+    func autoRun(_ url: String, _ buttons: [AXUIElement], old: [AXUIElement], busy: Bool, resumed: Bool) -> Bool {
         let now = Date()
         // ponytail: fixed 30 min. Away from a session longer than that: its blocks are history again.
         if let t = runSeenAt[url], now.timeIntervalSince(t) > 1800 { runs[url] = nil }
         let resumed = resumed && runs[url] != nil
         runSeenAt[url] = now
-        // A button whose command can't be read is never pressed.
-        let items = buttons.filter { enclosingURL($0) == url }.map { ($0, commandParts($0)) }
-            .map { ($0.0, $0.1.joined().trimmingCharacters(in: .whitespacesAndNewlines), $0.1) }.filter { !$0.1.isEmpty }
         var tracker = runs[url] ?? RunTracker()
-        let pick = tracker.step(url: url, cmds: items.map { $0.1 }, busy: busy, resumed: resumed)
+        // A button whose command can't be read is never pressed.
+        func read(_ els: [AXUIElement]) -> [(AXUIElement, String, [String])] {
+            els.filter { enclosingURL($0) == url }.map { ($0, commandParts($0)) }
+                .map { ($0.0, $0.1.joined().trimmingCharacters(in: .whitespacesAndNewlines), $0.1) }.filter { !$0.1.isEmpty }
+        }
+        // Blocks from before your latest message are history, unless already accepted as new
+        // (the output of the first command of a set arrives as a message of yours).
+        let older = read(old)
+        let items = read(buttons) + older.filter { tracker.pending.contains($0.1) }
+        let oldCmds = older.map { $0.1 }.filter { !tracker.pending.contains($0) }
+        tracker.seen.formUnion(oldCmds)
+        let pick = tracker.step(url: url, cmds: items.map { $0.1 } + oldCmds, busy: busy, resumed: resumed)
         runs[url] = tracker
         guard let i = pick else { return false }
         let (el, cmd, parts) = items[i]
@@ -583,6 +605,9 @@ enum Entry {
             precondition(skipPattern(["git push"], leadIn: "If it fails, run:", nil) != nil)
             precondition(skipPattern(["git push -u origin feature"], leadIn: "Push needs your click, or you run it:", nil) == nil)
             precondition(skipPattern(["ls"], leadIn: "", []) == nil && skipPattern(["ls"], leadIn: "", ["("]) == "(")
+            precondition(pickLeadIn(["bash", "Rollback, only if needed:"]) == "bash Rollback, only if needed:")
+            precondition(pickLeadIn(["Push needs your click, or you run it:", "older text"]) == "Push needs your click, or you run it:")
+            precondition(pickLeadIn([]) == "" && pickLeadIn(["bash"]) == "bash")
             precondition(riskyPattern("echo hi", nil) == nil && riskyPattern("ls", ["("]) == "(")
             let t = try! JSONDecoder().decode(State.self, from: Data(#"{"until":123.5,"askRisky":true,"askPatterns":[]}"#.utf8))
             precondition(t.until == 123.5 && t.askRisky && t.askPatterns == [] && !t.enabled && t.buttons == defaultButtons)
