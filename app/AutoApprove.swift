@@ -150,11 +150,15 @@ func label(_ e: AXUIElement) -> String {
 
 /// Depth-first walk of all Claude windows; calls visit(button, label) for every AXButton.
 // ponytail: full-tree poll, capped at maxNodes; switch to AXObserver if CPU shows up.
-/// URL of the session page (https://claude.ai/...) met by the last walkButtons(), if any.
-var sessionURLSeen: String?
+/// Filled by walkButtons(): each session page (https://claude.ai/...) it met, and whether Claude
+/// is working there. Working = the page marks its message list busy (aria-busy), or shows "Stop".
+/// "Stop" alone is not enough: it turns into "Send" as soon as you type in the prompt box.
+var sessionBusy: [String: Bool] = [:]
+var stopOutsideSession = false   // a "Stop" button in Claude's own chrome: counts for every session
+var watchBusy = false            // read the busy flag (one more AX call per group) only for auto-run
 
 func walkButtons(maxNodes: Int = 30000, _ visit: (AXUIElement, String) -> Bool) {
-    sessionURLSeen = nil
+    sessionBusy = [:]; stopOutsideSession = false
     for app in NSRunningApplication.runningApplications(withBundleIdentifier: claudeBundleID) {
         let ax = AXUIElementCreateApplication(app.processIdentifier)
         // Electron exposes web content to AX only when asked.
@@ -166,20 +170,27 @@ func walkButtons(maxNodes: Int = 30000, _ visit: (AXUIElement, String) -> Bool) 
         // can't forge (window title is page-controlled) marks them as Claude's own, so they stay
         // untrusted: fail closed. The hook still answers tool prompts there.
         for window in (attr(ax, kAXWindowsAttribute) as? [AXUIElement]) ?? [] {
-            var stack = [(window, false)]
+            var stack: [(AXUIElement, Bool, String?)] = [(window, false, nil)]
             var seen = 0
-            while let (e, parentTrusted) = stack.popLast(), seen < maxNodes {
+            while let (e, parentTrusted, parentSession) = stack.popLast(), seen < maxNodes {
                 seen += 1
                 let role = attr(e, kAXRoleAttribute) as? String
-                var trusted = parentTrusted
+                var trusted = parentTrusted, session = parentSession
                 if role == "AXWebArea" {
                     guard !parentTrusted, isTrustedOrigin(webURL(e), appBundle: app.bundleURL) else { continue }
                     trusted = true
-                    if let u = webURL(e), u.hasPrefix("https://") { sessionURLSeen = u }
+                    if let u = webURL(e), u.hasPrefix("https://") { session = u; if sessionBusy[u] == nil { sessionBusy[u] = false } }
                 }
-                if trusted, role == kAXButtonRole as String, !visit(e, label(e)) { return }
+                if trusted, role == kAXButtonRole as String {
+                    let name = label(e)
+                    if name == stopLabel { if let s = session { sessionBusy[s] = true } else { stopOutsideSession = true } }
+                    if !visit(e, name) { return }
+                } else if watchBusy, let s = session, sessionBusy[s] == false, role == kAXGroupRole as String,
+                          (attr(e, "AXElementBusy") as? Bool) == true {
+                    sessionBusy[s] = true
+                }
                 let kids = (attr(e, kAXChildrenAttribute) as? [AXUIElement]) ?? []
-                stack.append(contentsOf: kids.map { ($0, trusted) })
+                stack.append(contentsOf: kids.map { ($0, trusted, session) })
             }
         }
     }
@@ -237,10 +248,13 @@ func leadIn(_ button: AXUIElement, command: String) -> String {
         guard let p = attr(cur, kAXParentAttribute) else { break }
         let parent = p as! AXUIElement
         let kids = (attr(parent, kAXChildrenAttribute) as? [AXUIElement]) ?? []
-        if let i = kids.firstIndex(where: { CFEqual($0, cur) }), i > 0 {
-            let t = (texts(kids[i - 1]) ?? []).joined().trimmingCharacters(in: .whitespacesAndNewlines)
-            // The code itself is a sibling of the button bar: not a lead-in.
-            if !t.isEmpty, t != command { return t }
+        if let i = kids.firstIndex(where: { CFEqual($0, cur) }) {
+            for k in kids[..<i].reversed() {  // nearest sibling with any text; empty spacers don't hide it
+                let t = (texts(k) ?? []).joined().trimmingCharacters(in: .whitespacesAndNewlines)
+                if t.isEmpty { continue }
+                if t != command { return t }
+                break  // the code itself is a sibling of the button bar: not a lead-in, look higher
+            }
         }
         cur = parent
     }
@@ -316,9 +330,10 @@ struct RunTracker {
         pending.formIntersection(cmds)  // drop half-streamed text that is gone
         let known = seen.union(pending)
         let newcomers = cmds.prefix { !known.contains($0) }
-        // Added on top of what was there (not a page swap) while Claude is working, or within
-        // 3 ticks of it stopping: the last message can render at the moment the turn ends.
-        if resumed || idleTicks <= 3 && last.allSatisfy({ !seen.contains($0) || cmds.contains($0) }) { pending.formUnion(newcomers) }
+        // Added on top of what was there (never a page swap), and either while Claude is working,
+        // within 3 ticks of it stopping (the last message can render as the turn ends), or
+        // while you were in another session.
+        if resumed || idleTicks <= 3, last.allSatisfy({ !seen.contains($0) || cmds.contains($0) }) { pending.formUnion(newcomers) }
         seen.formUnion(cmds.filter { !pending.contains($0) })
         if busy { return nil }
         let ready = cmds.prefix { pending.contains($0) }
@@ -346,7 +361,7 @@ final class Model: ObservableObject {
     private var ticks = 0
     private var lastMtime: Date?
     private var runs: [String: RunTracker] = [:]   // one per session page URL
-    private var runURL: String?                    // session seen last tick
+    private var runURLs = Set<String>()            // sessions seen last tick
     private var runSeenAt: [String: Date] = [:]
 
     init() {
@@ -402,9 +417,9 @@ final class Model: ObservableObject {
         // A vanished button proves nothing (tab switch, other window), nor does turning ON.
         holding = FileManager.default.fileExists(atPath: holdURL.path)
         if holding { return }
-        var runButtons: [AXUIElement] = [], busy = false, pressed = false
+        var runButtons: [AXUIElement] = [], pressed = false
+        watchBusy = state.autoRun
         walkButtons { el, name in
-            if name == stopLabel { busy = true }
             if state.autoRun, name == runLabel { runButtons.append(el); return true }
             guard wanted.contains(name), (attr(el, kAXEnabledAttribute) as? Bool) ?? true else { return true }
             // The walk takes time: re-check the switch and timer right before pressing.
@@ -416,24 +431,31 @@ final class Model: ObservableObject {
             return false  // one press per tick; UI re-renders before next
         }
         guard state.autoRun else { runs = [:]; return }
-        if !pressed { autoRun(runButtons, busy: busy) }
+        if pressed { return }
+        // Each visible session on its own; one press per tick.
+        let sessions = sessionBusy
+        for url in sessions.keys.sorted() {
+            let resumed = !runURLs.contains(url) && runs[url] != nil
+            if autoRun(url, runButtons, busy: sessions[url] == true || stopOutsideSession, resumed: resumed) { break }
+        }
+        runURLs = Set(sessions.keys)
     }
 
     /// Press the Run button of a command block Claude just wrote (see RunTracker).
-    func autoRun(_ buttons: [AXUIElement], busy: Bool) {
-        guard let url = sessionURLSeen else { runURL = nil; return }
+    /// True when it acted on a block (pressed, or logged why not).
+    func autoRun(_ url: String, _ buttons: [AXUIElement], busy: Bool, resumed: Bool) -> Bool {
         let now = Date()
         // ponytail: fixed 30 min. Away from a session longer than that: its blocks are history again.
         if let t = runSeenAt[url], now.timeIntervalSince(t) > 1800 { runs[url] = nil }
-        let resumed = runURL != url && runs[url] != nil
-        runURL = url; runSeenAt[url] = now
+        let resumed = resumed && runs[url] != nil
+        runSeenAt[url] = now
         // A button whose command can't be read is never pressed.
         let items = buttons.filter { enclosingURL($0) == url }.map { ($0, commandParts($0)) }
             .map { ($0.0, $0.1.joined().trimmingCharacters(in: .whitespacesAndNewlines), $0.1) }.filter { !$0.1.isEmpty }
         var tracker = runs[url] ?? RunTracker()
         let pick = tracker.step(url: url, cmds: items.map { $0.1 }, busy: busy, resumed: resumed)
         runs[url] = tracker
-        guard let i = pick else { return }
+        guard let i = pick else { return false }
         let (el, cmd, parts) = items[i]
         var entry = ["ts": timestamp.string(from: Date()), "src": "run", "summary": String(cmd.prefix(80))]
         if let p = skipPattern(parts, leadIn: leadIn(el, command: cmd), state.autoRunSkip) {
@@ -442,10 +464,11 @@ final class Model: ObservableObject {
             entry["decision"] = "ask"; entry["why"] = p  // left for you to run
         } else {
             guard state.enabled, state.until.map({ Date().timeIntervalSince1970 <= $0 }) ?? true,
-                  !FileManager.default.fileExists(atPath: holdURL.path) else { return }
+                  !FileManager.default.fileExists(atPath: holdURL.path) else { return true }
             entry["decision"] = AXUIElementPerformAction(el, kAXPressAction as CFString) == .success ? "pressed" : "press-failed"
         }
         appendLog(entry)
+        return true
     }
 
     func resumeClicker() { try? FileManager.default.removeItem(at: holdURL); holding = false }
@@ -542,6 +565,7 @@ enum Entry {
             for _ in 0..<3 { precondition(r.step(url: "s1", cmds: ["late"], busy: false) == nil) }
             precondition(r.step(url: "s1", cmds: ["idle", "late"], busy: false) == nil)   // appeared with no turn
             precondition(r.step(url: "s1", cmds: ["away", "idle", "late"], busy: false, resumed: true) == 0)  // written while away
+            precondition(r.step(url: "s1", cmds: ["swapped"], busy: false, resumed: true) == nil)  // other page under same URL
             var first = RunTracker()                                                      // session with no block yet
             precondition(first.step(url: "n", cmds: [], busy: true) == nil)
             precondition(first.step(url: "n", cmds: ["one"], busy: true) == nil)
@@ -567,6 +591,7 @@ enum Entry {
         }
         if CommandLine.arguments.contains("--dump") {
             guard AXIsProcessTrusted() else { print("not trusted: grant Accessibility to this binary"); exit(1) }
+            watchBusy = true
             walkButtons { el, name in
                 print("AXButton: \(name.isEmpty ? "<no label>" : name)")
                 if name == runLabel {
@@ -575,6 +600,7 @@ enum Entry {
                 }
                 return true
             }
+            for (u, b) in sessionBusy { print("Session busy=\(b || stopOutsideSession) url=\(u)") }
             if CommandLine.arguments.contains("--webareas") {
                 for app in NSRunningApplication.runningApplications(withBundleIdentifier: claudeBundleID) {
                     var stack = (attr(AXUIElementCreateApplication(app.processIdentifier), kAXWindowsAttribute) as? [AXUIElement]) ?? []
